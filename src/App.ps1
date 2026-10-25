@@ -155,7 +155,7 @@ function Stop-Thumbs {
 }
 function Start-Thumbs($items, $path) {
     Stop-Thumbs
-    $jpgs = @($items | Where-Object { $_.IsJpg -and -not $_.IsCloud })
+    $jpgs = @($items | Where-Object { $_.IsJpg -and -not $_.IsCloud -and ((Get-NeededPx) -le 160) })
     if ($jpgs.Count -eq 0) { return }
     $md5 = [Security.Cryptography.MD5]::Create()
     $h = ([BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($path.ToLower()))) -replace '-', '').Substring(0, 16)
@@ -1826,7 +1826,183 @@ $win.Add_Closing({
 
 Show-Metadata
 # ===== END SCRIPT8 =====
+# ===== SCRIPT9-MARKER =====
+$script:tileSize = 100
+$script:loadedPx = 160
+$script:shellPx = 160
+$st9 = $null
+if ([IO.File]::Exists($settingsFile)) { try { $st9 = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch { } }
+if ($st9 -and $st9.TileSize) { try { $script:tileSize = [Math]::Max(70, [Math]::Min(300, [int]$st9.TileSize)) } catch { } }
+
+function Get-NeededPx {
+    $px = [int]([Math]::Ceiling($script:tileSize * 1.5 / 32) * 32)
+    return [Math]::Max(160, [Math]::Min(512, $px))
+}
+
+# ---------- Tile templates generated for the chosen size ----------
+function Set-TileResources {
+    $S = [int]$script:tileSize
+    $fs = [Math]::Max(13, [Math]::Min(22, [int](14 + $S / 50)))
+    $map = @{
+        '@@S@@'  = "$S"
+        '@@BW@@' = "$($S + 52)"
+        '@@BH@@' = "$($S + 78)"
+        '@@TW@@' = "$($S + 36)"
+        '@@FS@@' = "$fs"
+        '@@MH@@' = "$([int]($fs * 2.9))"
+        '@@BF@@' = "$([Math]::Max(10, [int](12 * $S / 100)))"
+    }
+    $tpl = @"
+<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <StackPanel Margin="8,6" HorizontalAlignment="Center">
+    <Grid Width="@@S@@" Height="@@S@@">
+      <Border CornerRadius="8" Background="{Binding BadgeColor}">
+        <TextBlock Text="{Binding Badge}" Foreground="White" FontWeight="Bold" FontSize="@@BF@@"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <Image Source="{Binding Thumb}" Stretch="UniformToFill"/>
+    </Grid>
+    <TextBlock Text="{Binding Name}" ToolTip="{Binding FullPath}" Width="@@TW@@" TextAlignment="Center"
+               TextTrimming="CharacterEllipsis" Margin="0,6,0,0" FontSize="@@FS@@" TextWrapping="Wrap" MaxHeight="@@MH@@"/>
+  </StackPanel>
+</DataTemplate>
+"@
+    $sty = @"
+<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="ListViewItem">
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ListViewItem">
+        <Border x:Name="bd" Width="@@BW@@" Height="@@BH@@" Margin="1" BorderThickness="1" BorderBrush="Transparent" Background="Transparent">
+          <ContentPresenter/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#F0F7FF"/></Trigger>
+          <Trigger Property="IsSelected" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="#E3F2FD"/>
+            <Setter TargetName="bd" Property="BorderBrush" Value="#90CAF9"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+"@
+    foreach ($k in @($map.Keys)) { $tpl = $tpl.Replace($k, $map[$k]); $sty = $sty.Replace($k, $map[$k]) }
+    $win.Resources['tileTemplate'] = [Windows.Markup.XamlReader]::Parse($tpl)
+    $win.Resources['tileStyle'] = [Windows.Markup.XamlReader]::Parse($sty)
+}
+
+# ---------- Redefined: shell thumbnails at a requested pixel size ----------
+function Start-ShellThumbs($items, $includeJpg = $false, $force = $false, $px = 0) {
+    Stop-ShellThumbs
+    if ($px -le 0) { $px = Get-NeededPx }
+    $script:shellPx = $px
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud) { continue }
+        if ($it.IsJpg -and -not $includeJpg) { continue }
+        if ($it.Thumb -and -not $force) { continue }
+        $paths.Add($it.FullPath)
+        $script:shellMap[$it.FullPath] = $it
+    }
+    if ($paths.Count -eq 0) { return }
+    $w = New-Object ShellThumbWorker
+    $script:shellWorker = $w
+    $w.Start($paths.ToArray(), [int]$px)
+    $shellTimer.Start()
+}
+
+function New-IconTile($icon) {
+    $size = [int]$script:shellPx
+    if ($size -lt 64) { $size = 160 }
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $bg = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(238, 242, 247))
+    $dc.DrawRectangle($bg, $null, [System.Windows.Rect]::new(0, 0, $size, $size))
+    $w = $size * 0.7
+    $dc.DrawImage($icon, [System.Windows.Rect]::new(($size - $w) / 2, ($size - $w) / 2, $w, $w))
+    $dc.Close()
+    $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($size, $size, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($dv)
+    $rtb.Freeze()
+    return $rtb
+}
+
+function After-FolderLoad($items) {
+    $script:folderItems = $items
+    $px = Get-NeededPx
+    $script:loadedPx = $px
+    Start-ShellThumbs $items ($px -gt 160) $false $px
+    Reset-Search
+    Start-ColMeta $items
+}
+
+function Upgrade-Thumbs {
+    $px = Get-NeededPx
+    if ($px -le $script:loadedPx) { return }
+    $script:loadedPx = $px
+    $items = @($list.ItemsSource)
+    if ($items.Count -eq 0) { return }
+    Start-ShellThumbs $items $true $true $px
+}
+
+function Apply-TileSize {
+    Set-TileResources
+    if ($rbThumbs.IsChecked) { Apply-View }
+    Upgrade-Thumbs
+}
+
+# ---------- Slider + Ctrl/wheel ----------
+$sizeSlider = New-Object System.Windows.Controls.Slider
+$sizeSlider.Minimum = 70
+$sizeSlider.Maximum = 300
+$sizeSlider.Value = $script:tileSize
+$sizeSlider.Width = 120
+$sizeSlider.VerticalAlignment = 'Center'
+$sizeSlider.Margin = [System.Windows.Thickness]::new(12, 0, 0, 0)
+$sizeSlider.IsMoveToPointEnabled = $true
+$sizeSlider.ToolTip = 'Thumbnail size (Ctrl + mouse wheel also works)'
+$dpTop = $rbThumbs.Parent
+$dpTop.Children.Insert($dpTop.Children.IndexOf($rbThumbs) + 1, $sizeSlider)
+if ($rbThumbs.IsChecked) { $sizeSlider.Visibility = 'Visible' } else { $sizeSlider.Visibility = 'Collapsed' }
+$rbThumbs.Add_Checked({ $sizeSlider.Visibility = 'Visible' })
+$rbThumbs.Add_Unchecked({ $sizeSlider.Visibility = 'Collapsed' })
+
+$sizeTimer = New-Object System.Windows.Threading.DispatcherTimer
+$sizeTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+$sizeTimer.Add_Tick({ $sizeTimer.Stop(); Apply-TileSize })
+$sizeSlider.Add_ValueChanged({
+    $script:tileSize = [int]$sizeSlider.Value
+    $sizeTimer.Stop()
+    $sizeTimer.Start()
+})
+
+$list.Add_PreviewMouseWheel({
+    param($s, $e)
+    $m = [int][System.Windows.Input.Keyboard]::Modifiers
+    if ((($m -band 2) -ne 0) -and $rbThumbs.IsChecked) {
+        $v = $sizeSlider.Value + ([Math]::Sign($e.Delta) * 15)
+        $sizeSlider.Value = [Math]::Max(70, [Math]::Min(300, $v))
+        $e.Handled = $true
+    }
+})
+
+# remember the size
+$win.Add_Closing({
+    try {
+        if ([IO.File]::Exists($settingsFile)) {
+            $o = Get-Content $settingsFile -Raw | ConvertFrom-Json
+            if ($o.PSObject.Properties['TileSize']) { $o.TileSize = [int]$script:tileSize }
+            else { $o | Add-Member -NotePropertyName TileSize -NotePropertyValue ([int]$script:tileSize) }
+            $o | ConvertTo-Json | Set-Content $settingsFile -Encoding UTF8
+        }
+    } catch { }
+})
+
+Set-TileResources
+# ===== END SCRIPT9 =====
 $win.ShowDialog() | Out-Null
+
 
 
 
