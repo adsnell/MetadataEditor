@@ -1,0 +1,6 @@
+﻿cache/
+logs/
+bin/
+*.bak
+*.bak3
+*.xaml.bak
