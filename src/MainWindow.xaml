@@ -47,15 +47,15 @@
           </Border>
           <Image Source="{Binding Thumb}" Stretch="UniformToFill"/>
         </Grid>
-        <TextBlock Text="{Binding Name}" ToolTip="{Binding Name}" Width="124" TextAlignment="Center"
-                   TextTrimming="CharacterEllipsis" Margin="0,6,0,0" FontSize="14"/>
+        <TextBlock Text="{Binding Name}" ToolTip="{Binding FullPath}" Width="136" TextAlignment="Center"
+                   TextTrimming="CharacterEllipsis" Margin="0,6,0,0" FontSize="16" TextWrapping="Wrap" MaxHeight="46"/>
       </StackPanel>
     </DataTemplate>
     <Style x:Key="tileStyle" TargetType="ListViewItem">
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ListViewItem">
-            <Border x:Name="bd" Width="140" Height="156" Margin="1" BorderThickness="1" BorderBrush="Transparent" Background="Transparent">
+            <Border x:Name="bd" Width="152" Height="178" Margin="1" BorderThickness="1" BorderBrush="Transparent" Background="Transparent">
               <ContentPresenter/>
             </Border>
             <ControlTemplate.Triggers>
@@ -158,4 +158,5 @@
     </Border>
   </Grid>
 </Window>
+
 

@@ -20,6 +20,7 @@ public class FileItem : INotifyPropertyChanged {
     public string BadgeColor { get; set; }
     public string SizeText { get; set; }
     public string CreatedText { get; set; }
+    public string FolderText { get; set; }
     public bool IsDir { get; set; }
     public bool IsJpg { get; set; }
     public long Size { get; set; }
@@ -788,7 +789,10 @@ Add-Type -TypeDefinition @"
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 public static class ShellThumb {
@@ -807,7 +811,8 @@ public static class ShellThumb {
     [DllImport("gdi32.dll")]
     static extern bool DeleteObject(IntPtr h);
 
-    public static IntPtr Get(string path, int size) {
+    public static IntPtr Get(string path, int size, out bool isIcon) {
+        isIcon = false;
         try {
             Guid iid = new Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b");
             IShellItemImageFactory f;
@@ -815,6 +820,7 @@ public static class ShellThumb {
             SIZE s; s.cx = size; s.cy = size;
             IntPtr h;
             int hr = f.GetImage(s, 8, out h);
+            if (hr != 0) { isIcon = true; hr = f.GetImage(s, 4, out h); }
             Marshal.ReleaseComObject(f);
             if (hr == 0) return h;
             return IntPtr.Zero;
@@ -824,8 +830,10 @@ public static class ShellThumb {
     public static void Delete(IntPtr h) { if (h != IntPtr.Zero) DeleteObject(h); }
 }
 
+public class ThumbResult { public string FilePath; public IntPtr H; public bool IsIcon; }
+
 public class ShellThumbWorker {
-    private ConcurrentQueue<KeyValuePair<string, IntPtr>> results = new ConcurrentQueue<KeyValuePair<string, IntPtr>>();
+    private ConcurrentQueue<ThumbResult> results = new ConcurrentQueue<ThumbResult>();
     public volatile bool Done;
     private volatile bool stop;
     private Thread th;
@@ -834,8 +842,13 @@ public class ShellThumbWorker {
         th = new Thread(delegate() {
             foreach (string p in paths) {
                 if (stop) break;
-                IntPtr h = ShellThumb.Get(p, size);
-                if (h != IntPtr.Zero) results.Enqueue(new KeyValuePair<string, IntPtr>(p, h));
+                bool icon;
+                IntPtr h = ShellThumb.Get(p, size, out icon);
+                if (h != IntPtr.Zero) {
+                    ThumbResult r = new ThumbResult();
+                    r.FilePath = p; r.H = h; r.IsIcon = icon;
+                    results.Enqueue(r);
+                }
             }
             Done = true;
         });
@@ -845,23 +858,101 @@ public class ShellThumbWorker {
     }
 
     public object[] Take() {
-        KeyValuePair<string, IntPtr> kv;
-        if (results.TryDequeue(out kv)) return new object[] { kv.Key, kv.Value };
+        ThumbResult r;
+        if (results.TryDequeue(out r)) return new object[] { r.FilePath, r.H, r.IsIcon };
         return null;
     }
 
     public bool IsEmpty { get { return results.IsEmpty; } }
     public void Stop() { stop = true; }
     public void Drain() {
-        KeyValuePair<string, IntPtr> kv;
-        while (results.TryDequeue(out kv)) ShellThumb.Delete(kv.Value);
+        ThumbResult r;
+        while (results.TryDequeue(out r)) ShellThumb.Delete(r.H);
     }
+}
+
+public class DeepWalker {
+    public volatile bool Done;
+    public volatile int Count;
+    private volatile bool stop;
+    private string[] files = new string[0];
+    public Dictionary<string, string> Meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private Thread th;
+
+    public void Start(string root, int max) {
+        th = new Thread(delegate() {
+            List<string> all = new List<string>();
+            Stack<string> dirs = new Stack<string>();
+            dirs.Push(root);
+            while (dirs.Count > 0 && !stop) {
+                string d = dirs.Pop();
+                try { foreach (string f in Directory.EnumerateFiles(d)) { all.Add(f); } } catch { }
+                Count = all.Count;
+                if (all.Count >= max) break;
+                try {
+                    foreach (string sd in Directory.EnumerateDirectories(d)) {
+                        try { if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; }
+                        dirs.Push(sd);
+                    }
+                } catch { }
+            }
+            files = all.ToArray();
+            Done = true;
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    public int FileCount { get { return files.Length; } }
+    public void Stop() { stop = true; }
+
+    public string[] Filter(string[] terms, int max) {
+        List<string> res = new List<string>();
+        foreach (string f in files) {
+            string name = Path.GetFileName(f).ToLowerInvariant();
+            string m;
+            Meta.TryGetValue(f, out m);
+            bool ok = true;
+            foreach (string t in terms) {
+                if (!(name.Contains(t) || (m != null && m.Contains(t)))) { ok = false; break; }
+            }
+            if (ok) { res.Add(f); if (res.Count >= max) break; }
+        }
+        return res.ToArray();
+    }
+}
+
+public class AsyncExif {
+    private Process p;
+    private StringBuilder sb = new StringBuilder();
+    private object gate = new object();
+    public volatile bool Done;
+
+    public void Start(string exe, string argFile) {
+        ProcessStartInfo psi = new ProcessStartInfo(exe, "-@ \"" + argFile + "\"");
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+        p = Process.Start(psi);
+        p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) {
+            if (e.Data == null) { Done = true; }
+            else { lock (gate) { sb.Append(e.Data); sb.Append('\n'); } }
+        };
+        p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { };
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
+    }
+
+    public string Output { get { lock (gate) { return sb.ToString(); } } }
+    public void Kill() { try { if (p != null && !p.HasExited) p.Kill(); } catch { } }
 }
 "@
 }
 
-# ---------- Shell thumbnails for non-JPG types ----------
-$script:shellExt = @('png','tif','tiff','psd','webp','pdf','mp4','mov','m4v','heic','heif','avif','gif','bmp')
+# ---------- Shell thumbnails / icons for every non-JPG file ----------
 $script:shellWorker = $null
 $script:shellMap = @{}
 $shellTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -877,22 +968,36 @@ function Stop-ShellThumbs {
     $script:shellMap = @{}
 }
 
-function Start-ShellThumbs($items) {
+function Start-ShellThumbs($items, $includeJpg = $false) {
     Stop-ShellThumbs
     $paths = New-Object 'System.Collections.Generic.List[string]'
     foreach ($it in $items) {
-        if ($it.IsDir -or $it.IsJpg) { continue }
-        $x = [IO.Path]::GetExtension($it.Name).TrimStart('.').ToLower()
-        if ($script:shellExt -contains $x) {
-            $paths.Add($it.FullPath)
-            $script:shellMap[$it.FullPath] = $it
-        }
+        if ($it.IsDir) { continue }
+        if ($it.IsJpg -and -not $includeJpg) { continue }
+        if ($it.Thumb) { continue }
+        $paths.Add($it.FullPath)
+        $script:shellMap[$it.FullPath] = $it
     }
     if ($paths.Count -eq 0) { return }
     $w = New-Object ShellThumbWorker
     $script:shellWorker = $w
     $w.Start($paths.ToArray(), 160)
     $shellTimer.Start()
+}
+
+function New-IconTile($icon) {
+    $size = 160
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $bg = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(238, 242, 247))
+    $dc.DrawRectangle($bg, $null, [System.Windows.Rect]::new(0, 0, $size, $size))
+    $w = $size * 0.7
+    $dc.DrawImage($icon, [System.Windows.Rect]::new(($size - $w) / 2, ($size - $w) / 2, $w, $w))
+    $dc.Close()
+    $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($size, $size, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($dv)
+    $rtb.Freeze()
+    return $rtb
 }
 
 $shellTimer.Add_Tick({
@@ -905,6 +1010,7 @@ $shellTimer.Add_Tick({
                 $bmp = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHBitmap($r[1], [IntPtr]::Zero, [System.Windows.Int32Rect]::Empty, [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
                 $bmp.Freeze()
                 [ShellThumb]::Delete($r[1])
+                if ([bool]$r[2]) { $bmp = New-IconTile $bmp }
                 $it = $script:shellMap[$path]
                 if ($it) { $it.Thumb = $bmp }
             } catch { }
@@ -913,12 +1019,34 @@ $shellTimer.Add_Tick({
     } catch { }
 })
 
-# ---------- Search (file names + XMP fields, current folder) ----------
+# ---------- Search state ----------
 $script:searchTerms = @()
 $script:metaText = @{}
 $script:metaReady = $false
+$script:folderItems = $null
+$script:deepActive = $false
+$script:deepReady = $false
+$script:deepWalker = $null
+$script:deepExif = $null
+$script:deepRoot = ''
 $txtSearch.ToolTip = 'Search file names and XMP (Title, Subject, Authors, Tags, Comments). Esc clears.'
 
+# Subfolders tick-box
+$chkSub = New-Object System.Windows.Controls.CheckBox
+$chkSub.Content = 'Subfolders'
+$chkSub.FontSize = 12
+$chkSub.VerticalAlignment = 'Center'
+$chkSub.Margin = [System.Windows.Thickness]::new(0, 0, 12, 0)
+$chkSub.ToolTip = 'Search this folder and everything below it'
+[System.Windows.Controls.DockPanel]::SetDock($chkSub, [System.Windows.Controls.Dock]::Right)
+$txtSearch.Parent.Children.Add($chkSub) | Out-Null
+
+function Set-FolderCol($show) {
+    $gv = $win.FindResource('detailsView')
+    if ($gv.Columns.Count -ge 5) { $gv.Columns[4].Width = $(if ($show) { 340 } else { 0 }) }
+}
+
+# ---------- Current-folder search ----------
 function Build-MetaIndex {
     $script:metaText = @{}
     $byKey = @{}
@@ -963,18 +1091,165 @@ $script:searchPredicate = [System.Predicate[object]]{
     return $true
 }
 
+# ---------- Subfolder search ----------
+function New-ItemFromPath($path, $sroot) {
+    try {
+        $f = New-Object IO.FileInfo $path
+        $ext = $f.Extension.TrimStart('.').ToUpper()
+        if (-not $ext) { $ext = 'FILE' }
+        if ($ext.Length -gt 9) { $ext = $ext.Substring(0, 9) }
+        $i = New-Object FileItem
+        $i.Name = $f.Name; $i.FullPath = $f.FullName; $i.Size = $f.Length; $i.Created = $f.CreationTime
+        $i.Badge = $ext
+        $i.BadgeColor = if ($colors.ContainsKey($ext)) { $colors[$ext] } else { '#3B9AF5' }
+        $i.IsJpg = ($ext -eq 'JPG' -or $ext -eq 'JPEG')
+        $i.SizeText = Format-Size $f.Length
+        $i.CreatedText = $f.CreationTime.ToString('dd/MM/yyyy HH:mm')
+        $d = $f.DirectoryName
+        $i.FolderText = if ($d.Length -gt $sroot.Length) { $d.Substring($sroot.Length).TrimStart('\') } else { '.' }
+        return $i
+    } catch { return $null }
+}
+
+function Import-DeepMeta($w, $json) {
+    if (-not $json -or -not $json.Trim()) { return }
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = [int]::MaxValue
+    $objs = $js.DeserializeObject($json)
+    foreach ($o in $objs) {
+        $sf = ([string]$o['SourceFile']) -replace '/', '\'
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($f in $fields) {
+            if ($o.ContainsKey($f.Key)) {
+                $v = $o[$f.Key]
+                if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { foreach ($e in $v) { $parts.Add([string]$e) } }
+                else { $parts.Add([string]$v) }
+            }
+        }
+        if ($parts.Count -gt 0) { $w.Meta[$sf] = ($parts -join ' ').ToLowerInvariant() }
+    }
+}
+
+function Show-DeepResults {
+    $w = $script:deepWalker
+    if (-not $w -or $script:searchTerms.Count -eq 0) { return }
+    $paths = $w.Filter([string[]]$script:searchTerms, 2000)
+    $items = New-Object 'System.Collections.Generic.List[FileItem]'
+    foreach ($pth in $paths) {
+        $i = New-ItemFromPath $pth $script:deepRoot
+        if ($i) { $items.Add($i) }
+    }
+    $script:deepActive = $true
+    $list.ItemsSource = $items
+    Set-FolderCol $true
+    Apply-Sort
+    Start-ShellThumbs $items $true
+    $more = ''
+    if ($paths.Count -ge 2000) { $more = ' (first 2000 shown)' }
+    $txtStatus.Text = "$($items.Count) match(es) in subfolders$more for '$($txtSearch.Text.Trim())'   |   $($w.FileCount) files searched"
+}
+
+function Stop-Deep {
+    $deepTimer.Stop()
+    if ($script:deepReady) { return }
+    if ($script:deepWalker) { $script:deepWalker.Stop() }
+    if ($script:deepExif) { $script:deepExif.Kill() }
+    $script:deepWalker = $null
+    $script:deepExif = $null
+}
+
+function Start-Deep {
+    $sroot = $txtPath.Text
+    if (-not $sroot -or -not [IO.Directory]::Exists($sroot)) { return }
+    if ([IO.Path]::GetPathRoot($sroot).TrimEnd('\') -ieq $sroot.TrimEnd('\')) {
+        $txtStatus.Text = 'Subfolder search needs a folder, not a whole drive.'
+        return
+    }
+    $script:deepRoot = $sroot
+    $script:deepReady = $false
+    $w = New-Object DeepWalker
+    $script:deepWalker = $w
+    $w.Start($sroot, 100000)
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($a in '-r', '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+    foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+    foreach ($ext in $script:xmpEmbedded) { $lines.Add('-ext'); $lines.Add($ext) }
+    $lines.Add($sroot)
+    $argFile = Join-Path $root 'cache\_deep_args.txt'
+    [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+    $x = New-Object AsyncExif
+    $script:deepExif = $x
+    $x.Start($cfg.ExifToolPath, $argFile)
+
+    $txtStatus.Text = 'Searching subfolders...'
+    $deepTimer.Start()
+}
+
+$deepTimer = New-Object System.Windows.Threading.DispatcherTimer
+$deepTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+$deepTimer.Add_Tick({
+    try {
+        $w = $script:deepWalker
+        $x = $script:deepExif
+        if (-not $w) { $deepTimer.Stop(); return }
+        if (-not $w.Done -or ($x -and -not $x.Done)) {
+            $txtStatus.Text = "Searching subfolders... $($w.Count) files scanned"
+            return
+        }
+        $deepTimer.Stop()
+        if ($x) { Import-DeepMeta $w $x.Output }
+        $script:deepReady = $true
+        $script:metaReady = $true
+        Show-DeepResults
+    } catch {
+        $deepTimer.Stop()
+        $txtStatus.Text = 'Subfolder search error: ' + $_.Exception.Message
+        Write-Log $_.Exception.ToString()
+    }
+})
+
+function Restore-Folder {
+    if (-not $script:deepActive) { return }
+    $script:deepActive = $false
+    Set-FolderCol $false
+    if ($script:folderItems) {
+        $v0 = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:folderItems)
+        if ($v0) { $v0.Filter = $null }
+        $list.ItemsSource = $script:folderItems
+        Apply-Sort
+        Start-ShellThumbs $script:folderItems
+    }
+}
+
 function Apply-Search {
-    $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
-    if (-not $v) { return }
     $q = $txtSearch.Text.Trim().ToLowerInvariant()
     if (-not $q) {
         $script:searchTerms = @()
-        $v.Filter = $null
-        $v.Refresh()
+        Stop-Deep
+        Restore-Folder
+        $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+        if ($v) { $v.Filter = $null; $v.Refresh() }
         if ($script:folderStatus) { $txtStatus.Text = $script:folderStatus }
         return
     }
     $script:searchTerms = @($q -split '\s+' | Where-Object { $_ })
+
+    if ($chkSub.IsChecked) {
+        if (-not $script:metaReady -and $script:deepReady) {
+            $script:deepReady = $false; $script:deepWalker = $null; $script:deepExif = $null
+        }
+        if ($script:deepReady) { Show-DeepResults; return }
+        if ($script:deepWalker) { $deepTimer.Start(); return }
+        Start-Deep
+        return
+    }
+
+    Stop-Deep
+    Restore-Folder
+    $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+    if (-not $v) { return }
     if (-not $script:metaReady) {
         $txtStatus.Text = 'Indexing XMP metadata...'
         $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
@@ -991,10 +1266,17 @@ function Reset-Search {
     $script:metaReady = $false
     $script:metaText = @{}
     $script:searchTerms = @()
+    $script:deepReady = $false
+    Stop-Deep
+    $script:deepWalker = $null
+    $script:deepExif = $null
+    $script:deepActive = $false
+    Set-FolderCol $false
     if ($txtSearch.Text) { $txtSearch.Text = '' }
 }
 
 function After-FolderLoad($items) {
+    $script:folderItems = $items
     Start-ShellThumbs $items
     Reset-Search
 }
@@ -1003,6 +1285,7 @@ $searchTimer = New-Object System.Windows.Threading.DispatcherTimer
 $searchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $searchTimer.Add_Tick({ $searchTimer.Stop(); Apply-Search })
 $txtSearch.Add_TextChanged({ $searchTimer.Stop(); $searchTimer.Start() })
+$chkSub.Add_Click({ $searchTimer.Stop(); Apply-Search })
 $txtSearch.Add_PreviewKeyDown({
     param($s, $e)
     if ($e.Key -eq 'Escape') { $txtSearch.Text = ''; $list.Focus() | Out-Null; $e.Handled = $true }
@@ -1016,6 +1299,7 @@ $win.Add_PreviewKeyDown({
 # ===== END SCRIPT6 =====
 
 $win.ShowDialog() | Out-Null
+
 
 
 
