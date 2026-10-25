@@ -32,10 +32,13 @@
       <Setter Property="BorderBrush" Value="#999"/>
     </Style>
       <GridView x:Key="detailsView" AllowsColumnReorder="False">
-      <GridViewColumn Header="Name" Width="340" DisplayMemberBinding="{Binding Name}"/>
-      <GridViewColumn Header="Type" Width="90" DisplayMemberBinding="{Binding Badge}"/>
-      <GridViewColumn Header="Size" Width="90" DisplayMemberBinding="{Binding SizeText}"/>
-      <GridViewColumn Header="Created" Width="150" DisplayMemberBinding="{Binding CreatedText}"/>
+      <GridViewColumn Header="Name" Width="300" DisplayMemberBinding="{Binding Name}"/>
+      <GridViewColumn Header="Created" Width="130" DisplayMemberBinding="{Binding CreatedText}"/>
+      <GridViewColumn Header="Title" Width="200" DisplayMemberBinding="{Binding TitleText}"/>
+      <GridViewColumn Header="Subject" Width="160" DisplayMemberBinding="{Binding SubjectText}"/>
+      <GridViewColumn Header="Author" Width="140" DisplayMemberBinding="{Binding AuthorText}"/>
+      <GridViewColumn Header="Tags" Width="220" DisplayMemberBinding="{Binding TagsText}"/>
+      <GridViewColumn Header="Folder" Width="0" DisplayMemberBinding="{Binding FolderText}"/>
     </GridView>
     <ItemsPanelTemplate x:Key="tilePanel"><WrapPanel/></ItemsPanelTemplate>
     <DataTemplate x:Key="tileTemplate">
@@ -138,6 +141,8 @@
           <TextBox x:Name="txtTags" Style="{StaticResource Fld}"/>
           <TextBlock Text="Comments:" Style="{StaticResource Lbl}"/>
           <TextBox x:Name="txtComments" Style="{StaticResource Fld}" Height="60" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
+          <TextBlock Text="Copyright:" Style="{StaticResource Lbl}"/>
+          <TextBox x:Name="txtCopyright" Style="{StaticResource Fld}"/>
           <TextBlock Text="Rating (1-5):" Style="{StaticResource Lbl}"/>
           <TextBox x:Name="txtRating" Style="{StaticResource Fld}"/>
           <Button x:Name="btnSave" Content="SAVE METADATA" Height="38" Margin="0,14,0,0" Background="#1565C0"
@@ -158,5 +163,6 @@
     </Border>
   </Grid>
 </Window>
+
 
 

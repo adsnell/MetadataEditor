@@ -21,6 +21,13 @@ public class FileItem : INotifyPropertyChanged {
     public string SizeText { get; set; }
     public string CreatedText { get; set; }
     public string FolderText { get; set; }
+    public bool IsCloud { get; set; }
+    private string _titleText, _subjectText, _authorText, _tagsText;
+    public string TitleText { get { return _titleText; } set { _titleText = value; Notify("TitleText"); } }
+    public string SubjectText { get { return _subjectText; } set { _subjectText = value; Notify("SubjectText"); } }
+    public string AuthorText { get { return _authorText; } set { _authorText = value; Notify("AuthorText"); } }
+    public string TagsText { get { return _tagsText; } set { _tagsText = value; Notify("TagsText"); } }
+    private void Notify(string n) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(n)); }
     public bool IsDir { get; set; }
     public bool IsJpg { get; set; }
     public long Size { get; set; }
@@ -148,7 +155,7 @@ function Stop-Thumbs {
 }
 function Start-Thumbs($items, $path) {
     Stop-Thumbs
-    $jpgs = @($items | Where-Object { $_.IsJpg })
+    $jpgs = @($items | Where-Object { $_.IsJpg -and -not $_.IsCloud })
     if ($jpgs.Count -eq 0) { return }
     $md5 = [Security.Cryptography.MD5]::Create()
     $h = ([BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($path.ToLower()))) -replace '-', '').Substring(0, 16)
@@ -254,7 +261,7 @@ function Load-Folder($path) {
             $i.Badge = $ext
             $i.BadgeColor = if ($colors.ContainsKey($ext)) { $colors[$ext] } else { '#3B9AF5' }
             $i.IsJpg = ($ext -eq 'JPG' -or $ext -eq 'JPEG')
-            $i.SizeText = Format-Size $f.Length
+            $i.SizeText = Format-Size $f.Length; $i.IsCloud = ((([int]$f.Attributes) -band 0x441000) -ne 0)
             $i.CreatedText = $f.CreationTime.ToString('dd/MM/yyyy HH:mm')
             $total += $f.Length
             $items.Add($i)
@@ -414,7 +421,7 @@ function Save-Metadata {
     $skipped = $all.Count - $sel.Count
     if ($skipped -gt 0) { $msg += "  |  $skipped unsupported file(s) skipped" }
     if ($err) { $msg += '  |  ' + (($err -split "`n")[0]); Write-Log $err }
-    $txtStatus.Text = $msg; $script:metaReady = $false
+    $txtStatus.Text = $msg; $script:metaReady = $false; Update-SavedCols
     Write-Log ("SAVE cmd: " + ($cmd -join " | "))
     Write-Log ("SAVE out: " + $out)
     [void][System.Windows.MessageBox]::Show($win, ($msg + "`n`n" + $out + $err), 'MetadataEditor')
@@ -1103,7 +1110,7 @@ function New-ItemFromPath($path, $sroot) {
         $i.Badge = $ext
         $i.BadgeColor = if ($colors.ContainsKey($ext)) { $colors[$ext] } else { '#3B9AF5' }
         $i.IsJpg = ($ext -eq 'JPG' -or $ext -eq 'JPEG')
-        $i.SizeText = Format-Size $f.Length
+        $i.SizeText = Format-Size $f.Length; $i.IsCloud = ((([int]$f.Attributes) -band 0x441000) -ne 0)
         $i.CreatedText = $f.CreationTime.ToString('dd/MM/yyyy HH:mm')
         $d = $f.DirectoryName
         $i.FolderText = if ($d.Length -gt $sroot.Length) { $d.Substring($sroot.Length).TrimStart('\') } else { '.' }
@@ -1298,7 +1305,530 @@ $win.Add_PreviewKeyDown({
 })
 # ===== END SCRIPT6 =====
 
+# ===== SCRIPT8-MARKER =====
+$txtCopyright = $win.FindName('txtCopyright')
+$settingsFile = Join-Path $root 'settings.json'
+
+# ---------- Copyright field (before Rating) ----------
+if (-not ($fields | Where-Object { $_.Key -eq 'Rights' })) {
+    $newFields = @()
+    foreach ($f in $fields) {
+        if ($f.Key -eq 'Rating') { $newFields += @{ Tag = 'XMP-dc:Rights'; Key = 'Rights'; Ctl = $txtCopyright; List = $false } }
+        $newFields += $f
+    }
+    $fields = $newFields
+}
+
+if (-not ('DeepWalker2' -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+
+public class DeepWalker2 {
+    public volatile bool Done;
+    public volatile int Count;
+    private volatile bool stop;
+    private string[] files = new string[0];
+    private string[] readable = new string[0];
+    public Dictionary<string, string> Meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private Thread th;
+
+    public void Start(string root, int max, string[] exts) {
+        th = new Thread(delegate() {
+            Dictionary<string, bool> ext = new Dictionary<string, bool>();
+            foreach (string e in exts) ext[e.ToLowerInvariant()] = true;
+            List<string> all = new List<string>();
+            List<string> read = new List<string>();
+            Stack<string> dirs = new Stack<string>();
+            dirs.Push(root);
+            while (dirs.Count > 0 && !stop) {
+                string d = dirs.Pop();
+                DirectoryInfo di = new DirectoryInfo(d);
+                try {
+                    foreach (FileInfo fi in di.EnumerateFiles()) {
+                        all.Add(fi.FullName);
+                        int a = (int)fi.Attributes;
+                        bool cloud = (a & 0x441000) != 0;
+                        if (!cloud && ext.ContainsKey(fi.Extension.TrimStart('.').ToLowerInvariant())) read.Add(fi.FullName);
+                    }
+                } catch { }
+                Count = all.Count;
+                if (all.Count >= max) break;
+                try {
+                    foreach (DirectoryInfo sd in di.EnumerateDirectories()) {
+                        int sa = (int)sd.Attributes;
+                        bool reparse = (sa & 0x400) != 0;
+                        bool cloudDir = (sa & 0x440000) != 0;
+                        if (reparse && !cloudDir) continue;
+                        dirs.Push(sd.FullName);
+                    }
+                } catch { }
+            }
+            files = all.ToArray();
+            readable = read.ToArray();
+            Done = true;
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    public int FileCount { get { return files.Length; } }
+    public string[] Readable { get { return readable; } }
+    public void Stop() { stop = true; }
+
+    public string[] Filter(string[] terms, int max) {
+        List<string> res = new List<string>();
+        foreach (string f in files) {
+            string name = Path.GetFileName(f).ToLowerInvariant();
+            string m;
+            Meta.TryGetValue(f, out m);
+            bool ok = true;
+            foreach (string t in terms) {
+                if (!(name.Contains(t) || (m != null && m.Contains(t)))) { ok = false; break; }
+            }
+            if (ok) { res.Add(f); if (res.Count >= max) break; }
+        }
+        return res.ToArray();
+    }
+}
+"@
+}
+
+# ---------- Field helpers + Details columns ----------
+function Get-FieldText($o, $key) {
+    $v = $null
+    if ($o -is [System.Collections.IDictionary]) { if ($o.ContainsKey($key)) { $v = $o[$key] } }
+    else { $v = $o.$key }
+    if ($null -eq $v) { return '' }
+    if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { return ((@($v | ForEach-Object { "$_" })) -join ', ') }
+    return "$v"
+}
+function Get-AllText($o) {
+    $parts = @()
+    foreach ($f in $fields) { $s = Get-FieldText $o $f.Key; if ($s) { $parts += $s } }
+    return (($parts -join ' ').ToLowerInvariant())
+}
+function Set-ItemCols($it, $o) {
+    $it.TitleText   = Get-FieldText $o 'Title'
+    $it.SubjectText = Get-FieldText $o 'Headline'
+    $it.AuthorText  = Get-FieldText $o 'Creator'
+    $it.TagsText    = Get-FieldText $o 'Subject'
+}
+function Set-FolderCol($show) {
+    $gv = $win.FindResource('detailsView')
+    foreach ($c in $gv.Columns) { if ("$($c.Header)" -eq 'Folder') { $c.Width = $(if ($show) { 340 } else { 0 }) } }
+}
+
+# sort by the metadata columns
+$list.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $h = $e.OriginalSource
+    if ($h -is [System.Windows.Controls.GridViewColumnHeader] -and $h.Role -ne 'Padding') {
+        $map2 = @{ 'Title' = 'TitleText'; 'Subject' = 'SubjectText'; 'Author' = 'AuthorText'; 'Tags' = 'TagsText' }
+        $prop = $map2["$($h.Content)"]
+        if ($prop) {
+            if ($script:sortProp -eq $prop -and $script:sortDir -eq 'Ascending') { $script:sortDir = 'Descending' }
+            else { $script:sortProp = $prop; $script:sortDir = 'Ascending' }
+            Apply-Sort
+        }
+    }
+})
+
+# ---------- Background metadata for the Details columns (current folder) ----------
+$script:colExif = $null
+$script:colMap = @{}
+$colTimer = New-Object System.Windows.Threading.DispatcherTimer
+$colTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+
+function Stop-ColMeta {
+    $colTimer.Stop()
+    if ($script:colExif) { $script:colExif.Kill() }
+    $script:colExif = $null
+}
+
+function Start-ColMeta($items) {
+    Stop-ColMeta
+    $map = @{}
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+    foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud -or -not (Get-XmpMode $it)) { continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $lines.Add($tp) }
+    }
+    if ($map.Count -eq 0) { return }
+    $argFile = Join-Path $root 'cache\_cols_args.txt'
+    [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+    $script:colMap = $map
+    $x = New-Object AsyncExif
+    $script:colExif = $x
+    $x.Start($cfg.ExifToolPath, $argFile)
+    $colTimer.Start()
+}
+
+$colTimer.Add_Tick({
+    try {
+        $x = $script:colExif
+        if (-not $x) { $colTimer.Stop(); return }
+        if (-not $x.Done) { return }
+        $colTimer.Stop()
+        $json = $x.Output
+        $map = $script:colMap
+        $script:colExif = $null
+        if ($json -and $json.Trim()) {
+            Add-Type -AssemblyName System.Web.Extensions
+            $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $js.MaxJsonLength = [int]::MaxValue
+            $objs = $js.DeserializeObject($json)
+            foreach ($o in $objs) {
+                $key = (([string]$o['SourceFile']) -replace '/', '\').ToLowerInvariant()
+                $it = $map[$key]
+                if (-not $it) { continue }
+                Set-ItemCols $it $o
+                $script:metaText[$it.FullPath] = (Get-AllText $o)
+            }
+            $script:metaReady = $true
+        }
+    } catch { Write-Log $_.Exception.ToString() }
+})
+
+function Update-SavedCols {
+    try {
+        $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir -and (Get-XmpMode $_) })
+        if ($sel.Count -eq 0) { return }
+        $map = @{}
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        foreach ($it in $sel) {
+            $tp = Get-MetaTarget $it
+            if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $cmd += $tp }
+        }
+        if ($map.Count -eq 0) { return }
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { return }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $it = $map[$key]
+            if ($it) { Set-ItemCols $it $o }
+        }
+    } catch { Write-Log $_.Exception.ToString() }
+}
+
+# ---------- Redefined: shell thumbnails skip cloud-only files ----------
+function Start-ShellThumbs($items, $includeJpg = $false) {
+    Stop-ShellThumbs
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud) { continue }
+        if ($it.IsJpg -and -not $includeJpg) { continue }
+        if ($it.Thumb) { continue }
+        $paths.Add($it.FullPath)
+        $script:shellMap[$it.FullPath] = $it
+    }
+    if ($paths.Count -eq 0) { return }
+    $w = New-Object ShellThumbWorker
+    $script:shellWorker = $w
+    $w.Start($paths.ToArray(), 160)
+    $shellTimer.Start()
+}
+
+function After-FolderLoad($items) {
+    $script:folderItems = $items
+    Start-ShellThumbs $items
+    Reset-Search
+    Start-ColMeta $items
+}
+
+# ---------- Redefined: subfolder search (cloud-safe, fills columns) ----------
+function New-ItemFromPath($path, $sroot) {
+    try {
+        $f = New-Object IO.FileInfo $path
+        $ext = $f.Extension.TrimStart('.').ToUpper()
+        if (-not $ext) { $ext = 'FILE' }
+        if ($ext.Length -gt 9) { $ext = $ext.Substring(0, 9) }
+        $i = New-Object FileItem
+        $i.Name = $f.Name; $i.FullPath = $f.FullName; $i.Size = $f.Length; $i.Created = $f.CreationTime
+        $i.Badge = $ext
+        $i.BadgeColor = if ($colors.ContainsKey($ext)) { $colors[$ext] } else { '#3B9AF5' }
+        $i.IsJpg = ($ext -eq 'JPG' -or $ext -eq 'JPEG')
+        $i.IsCloud = ((([int]$f.Attributes) -band 0x441000) -ne 0)
+        $i.SizeText = Format-Size $f.Length
+        $i.CreatedText = $f.CreationTime.ToString('dd/MM/yyyy HH:mm')
+        $d = $f.DirectoryName
+        $i.FolderText = if ($d.Length -gt $sroot.Length) { $d.Substring($sroot.Length).TrimStart('\') } else { '.' }
+        return $i
+    } catch { return $null }
+}
+
+$script:deepFields = @{}
+$script:deepExifStarted = $false
+
+function Import-DeepMeta($w, $json) {
+    if (-not $json -or -not $json.Trim()) { return }
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = [int]::MaxValue
+    $objs = $js.DeserializeObject($json)
+    foreach ($o in $objs) {
+        $sf = ([string]$o['SourceFile']) -replace '/', '\'
+        $txt = Get-AllText $o
+        if ($txt) { $w.Meta[$sf] = $txt }
+        $script:deepFields[$sf.ToLowerInvariant()] = $o
+    }
+}
+
+function Show-DeepResults {
+    $w = $script:deepWalker
+    if (-not $w -or $script:searchTerms.Count -eq 0) { return }
+    $paths = $w.Filter([string[]]$script:searchTerms, 2000)
+    $items = New-Object 'System.Collections.Generic.List[FileItem]'
+    foreach ($pth in $paths) {
+        $i = New-ItemFromPath $pth $script:deepRoot
+        if ($i) {
+            $o = $script:deepFields[$pth.ToLowerInvariant()]
+            if ($o) { Set-ItemCols $i $o }
+            $items.Add($i)
+        }
+    }
+    $script:deepActive = $true
+    $list.ItemsSource = $items
+    Set-FolderCol $true
+    Apply-Sort
+    Start-ShellThumbs $items $true
+    $more = ''
+    if ($paths.Count -ge 2000) { $more = ' (first 2000 shown)' }
+    $txtStatus.Text = "$($items.Count) match(es) in subfolders$more for '$($txtSearch.Text.Trim())'   |   $($w.FileCount) files searched"
+}
+
+function Start-Deep {
+    $sroot = $txtPath.Text
+    if (-not $sroot -or -not [IO.Directory]::Exists($sroot)) { return }
+    if ([IO.Path]::GetPathRoot($sroot).TrimEnd('\') -ieq $sroot.TrimEnd('\')) {
+        $txtStatus.Text = 'Subfolder search needs a folder, not a whole drive.'
+        return
+    }
+    $script:deepRoot = $sroot
+    $script:deepReady = $false
+    $script:deepExifStarted = $false
+    $script:deepExif = $null
+    $script:deepFields = @{}
+    $w = New-Object DeepWalker2
+    $script:deepWalker = $w
+    $w.Start($sroot, 100000, [string[]]$script:xmpEmbedded)
+    $txtStatus.Text = 'Searching subfolders...'
+    $deepTimer.Start()
+}
+
+$deepTimer = New-Object System.Windows.Threading.DispatcherTimer
+$deepTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+$deepTimer.Add_Tick({
+    try {
+        $w = $script:deepWalker
+        if (-not $w) { $deepTimer.Stop(); return }
+        if (-not $w.Done) { $txtStatus.Text = "Searching subfolders... $($w.Count) files scanned"; return }
+        if (-not $script:deepExifStarted) {
+            $script:deepExifStarted = $true
+            $rd = @($w.Readable)
+            if ($rd.Count -gt 0) {
+                $lines = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+                foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+                foreach ($r in $rd) { $lines.Add($r) }
+                $argFile = Join-Path $root 'cache\_deep_args.txt'
+                [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+                $x0 = New-Object AsyncExif
+                $script:deepExif = $x0
+                $x0.Start($cfg.ExifToolPath, $argFile)
+                return
+            }
+        }
+        $x = $script:deepExif
+        if ($x -and -not $x.Done) { $txtStatus.Text = "Reading XMP from $(@($w.Readable).Count) files..."; return }
+        $deepTimer.Stop()
+        if ($x) { Import-DeepMeta $w $x.Output }
+        $script:deepReady = $true
+        $script:metaReady = $true
+        Show-DeepResults
+    } catch {
+        $deepTimer.Stop()
+        $txtStatus.Text = 'Subfolder search error: ' + $_.Exception.Message
+        Write-Log $_.Exception.ToString()
+    }
+})
+
+# ---------- Open / rename / copy path / show in Explorer ----------
+$script:execExt = @('exe', 'bat', 'cmd', 'ps1', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'msi', 'com', 'scr', 'lnk', 'reg', 'jar')
+
+function Open-Items($items) {
+    $items = @($items)
+    if ($items.Count -eq 1 -and $items[0].IsDir) { Go-Path $items[0].FullPath; return }
+    $files = @($items | Where-Object { -not $_.IsDir })
+    if ($files.Count -eq 0) { return }
+    if ($files.Count -gt 5) {
+        if ((Msg "Open $($files.Count) files?" 'YesNo' 'Question') -ne 'Yes') { return }
+    }
+    foreach ($f in $files) {
+        $ext = [IO.Path]::GetExtension($f.Name).TrimStart('.').ToLower()
+        if ($script:execExt -contains $ext) {
+            if ((Msg "Run '$($f.Name)'?" 'YesNo' 'Warning') -ne 'Yes') { continue }
+        }
+        try { Start-Process -FilePath $f.FullPath -WorkingDirectory ([IO.Path]::GetDirectoryName($f.FullPath)) }
+        catch { $txtStatus.Text = "Cannot open $($f.Name): $($_.Exception.Message)" }
+    }
+}
+
+function Do-ShowInExplorer {
+    $sel = @($list.SelectedItems)
+    if ($sel.Count -eq 0) {
+        if ($txtPath.Text) { Start-Process explorer.exe -ArgumentList ('"' + $txtPath.Text + '"') }
+        return
+    }
+    Start-Process explorer.exe -ArgumentList ('/select,"' + $sel[0].FullPath + '"')
+}
+
+function Do-CopyPath {
+    $paths = @($list.SelectedItems | ForEach-Object { $_.FullPath })
+    if ($paths.Count -eq 0) { return }
+    [System.Windows.Clipboard]::SetText(($paths -join "`r`n"))
+    $txtStatus.Text = "Copied $($paths.Count) path(s) to clipboard"
+}
+
+function Do-Rename {
+    $sel = @($list.SelectedItems)
+    if ($sel.Count -ne 1) { $txtStatus.Text = 'Select one item to rename.'; return }
+    $it = $sel[0]
+    $new = Read-Input 'Rename' 'New name:' $it.Name
+    if ([string]::IsNullOrWhiteSpace($new)) { return }
+    $new = $new.Trim()
+    if ($new -ceq $it.Name) { return }
+    if ($new.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { [void](Msg 'That name contains invalid characters.' 'OK' 'Warning'); return }
+    $target = Join-Path ([IO.Path]::GetDirectoryName($it.FullPath)) $new
+    if ((Test-Path -LiteralPath $target) -and ($new -ine $it.Name)) { [void](Msg 'A file or folder with that name already exists.' 'OK' 'Warning'); return }
+    Stop-Thumbs
+    Stop-ColMeta
+    try { Rename-Item -LiteralPath $it.FullPath -NewName $new -ErrorAction Stop }
+    catch { [void](Msg ("Rename failed: " + $_.Exception.Message) 'OK' 'Warning') }
+    if ($script:deepActive) { $script:metaReady = $false; Apply-Search } else { Refresh-All }
+    $txtStatus.Text = "Renamed to '$new'"
+}
+
+# double-click a file to open it
+$list.Add_MouseDoubleClick({
+    param($s, $e)
+    try {
+        $dep = $e.OriginalSource -as [System.Windows.DependencyObject]
+        if (-not $dep) { return }
+        $c = [System.Windows.Controls.ItemsControl]::ContainerFromElement($list, $dep)
+        if ($c -and $c.Content -and -not $c.Content.IsDir) { Open-Items @($c.Content) }
+    } catch { }
+})
+
+# right-click selects the item under the pointer
+$list.Add_PreviewMouseRightButtonDown({
+    param($s, $e)
+    try {
+        $dep = $e.OriginalSource -as [System.Windows.DependencyObject]
+        if (-not $dep) { return }
+        $c = [System.Windows.Controls.ItemsControl]::ContainerFromElement($list, $dep)
+        if ($c -and -not $c.IsSelected) { $list.SelectedItems.Clear(); $c.IsSelected = $true }
+    } catch { }
+})
+
+# context menu
+$cm = New-Object System.Windows.Controls.ContextMenu
+$menuDefs = @(
+    @{ H = 'Open';              A = { Open-Items @($list.SelectedItems) } },
+    @{ H = 'Show in Explorer';  A = { Do-ShowInExplorer } },
+    @{ H = 'Copy path';         A = { Do-CopyPath } },
+    @{ H = 'Rename          F2'; A = { Do-Rename } },
+    @{ H = '-' },
+    @{ H = 'Cut';               A = { Set-ClipFiles (Get-SelPaths) $true } },
+    @{ H = 'Copy';              A = { Set-ClipFiles (Get-SelPaths) $false } },
+    @{ H = 'Paste';             A = { Do-Paste } },
+    @{ H = 'Delete';            A = { Do-Delete } }
+)
+foreach ($d in $menuDefs) {
+    if ($d.H -eq '-') { [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator)); continue }
+    $mi = New-Object System.Windows.Controls.MenuItem
+    $mi.Header = $d.H
+    $mi.Add_Click($d.A)
+    [void]$cm.Items.Add($mi)
+}
+$list.ContextMenu = $cm
+
+# Enter opens files, F2 renames
+$win.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.OriginalSource -is [System.Windows.Controls.TextBox]) { return }
+    if (-not $list.IsKeyboardFocusWithin) { return }
+    if ($e.Key -eq 'F2') { Do-Rename; $e.Handled = $true }
+    elseif ($e.Key -eq 'Return') {
+        $sel = @($list.SelectedItems)
+        if ($sel.Count -gt 0) { Open-Items $sel; $e.Handled = $true }
+    }
+})
+
+# ---------- OneDrive in the left panel ----------
+$od = @()
+foreach ($v in $env:OneDriveConsumer, $env:OneDriveCommercial, $env:OneDrive) {
+    if ($v -and [IO.Directory]::Exists($v) -and ($od -notcontains $v)) { $od += $v }
+}
+if ($od.Count -eq 0 -and $env:USERPROFILE) {
+    $fb = Join-Path $env:USERPROFILE 'OneDrive'
+    if ([IO.Directory]::Exists($fb)) { $od += $fb }
+}
+$pos = 0
+foreach ($v in $od) {
+    $n = Add-Node $tree.Items $v ([IO.Path]::GetFileName($v.TrimEnd('\')))
+    $tree.Items.Remove($n)
+    $tree.Items.Insert($pos, $n)
+    $pos++
+}
+
+# ---------- Remember window size/position and last folder ----------
+$st = $null
+if ([IO.File]::Exists($settingsFile)) { try { $st = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch { } }
+$script:lastFolder = $null
+if ($st) {
+    try {
+        $vl = [System.Windows.SystemParameters]::VirtualScreenLeft
+        $vt = [System.Windows.SystemParameters]::VirtualScreenTop
+        $vw = [System.Windows.SystemParameters]::VirtualScreenWidth
+        $vh = [System.Windows.SystemParameters]::VirtualScreenHeight
+        if ($st.Width -ge 700 -and $st.Height -ge 400 -and $st.Left -ge ($vl - 50) -and $st.Top -ge ($vt - 50) -and ($st.Left + 200) -le ($vl + $vw) -and ($st.Top + 100) -le ($vt + $vh)) {
+            $win.WindowStartupLocation = 'Manual'
+            $win.Left = [double]$st.Left; $win.Top = [double]$st.Top
+            $win.Width = [double]$st.Width; $win.Height = [double]$st.Height
+        }
+        if ($st.Maximized) { $win.WindowState = 'Maximized' }
+        if ($st.LastFolder) { $script:lastFolder = [string]$st.LastFolder }
+    } catch { }
+}
+$win.Add_ContentRendered({
+    if ($script:lastFolder -and [IO.Directory]::Exists($script:lastFolder)) {
+        try { Select-TreePath $script:lastFolder } catch { }
+    }
+    $script:lastFolder = $null
+})
+$win.Add_Closing({
+    try {
+        if ($win.WindowState -eq 'Normal') { $b = [System.Windows.Rect]::new($win.Left, $win.Top, $win.Width, $win.Height) } else { $b = $win.RestoreBounds }
+        $o = [ordered]@{ Left = $b.Left; Top = $b.Top; Width = $b.Width; Height = $b.Height; Maximized = ($win.WindowState -eq 'Maximized'); LastFolder = $txtPath.Text }
+        $o | ConvertTo-Json | Set-Content $settingsFile -Encoding UTF8
+    } catch { }
+    try { Stop-ColMeta; $script:deepReady = $false; Stop-Deep } catch { }
+})
+
+Show-Metadata
+# ===== END SCRIPT8 =====
 $win.ShowDialog() | Out-Null
+
+
 
 
 
