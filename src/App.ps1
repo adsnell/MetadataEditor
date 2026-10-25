@@ -3,6 +3,15 @@ $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
 $cfg = Get-Content (Join-Path $root 'config.json') -Raw | ConvertFrom-Json
+# PORTABLE-MARKER
+foreach ($d in 'cache', 'cache\thumbs', 'logs') { New-Item -ItemType Directory -Path (Join-Path $root $d) -Force | Out-Null }
+$bundledEt = Join-Path $root 'exiftool\exiftool.exe'
+if (Test-Path $bundledEt) { $cfg.ExifToolPath = $bundledEt }
+elseif (-not [IO.Path]::IsPathRooted([string]$cfg.ExifToolPath)) { $cfg.ExifToolPath = Join-Path $root ([string]$cfg.ExifToolPath) }
+if (-not (Test-Path $cfg.ExifToolPath)) {
+    [void][System.Windows.MessageBox]::Show("ExifTool was not found:`n$($cfg.ExifToolPath)`n`nPut exiftool.exe (with its exiftool_files folder) in the 'exiftool' folder next to this app.", 'MetadataEditor')
+    exit 0
+}
 $logFile = Join-Path $root 'logs\app.log'
 
 if (-not ('FileItem' -as [type])) {
@@ -2002,6 +2011,7 @@ $win.Add_Closing({
 Set-TileResources
 # ===== END SCRIPT9 =====
 $win.ShowDialog() | Out-Null
+
 
 
 
