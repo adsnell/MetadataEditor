@@ -139,6 +139,7 @@ function Read-Bitmap($path) {
     } catch { return $null }
 }
 function Stop-Thumbs {
+    Stop-ShellThumbs
     $timer.Stop()
     if ($script:thumbProc -and -not $script:thumbProc.HasExited) { try { $script:thumbProc.Kill() } catch { } }
     $script:thumbProc = $null
@@ -262,7 +263,7 @@ function Load-Folder($path) {
         $txtStatus.Text = "Cannot open folder: $($_.Exception.Message)"
     }
     $list.ItemsSource = $items
-    Start-Thumbs $items $path
+    Start-Thumbs $items $path; After-FolderLoad $items
 }
 
 # ----- XMP metadata -----
@@ -276,10 +277,33 @@ $fields = @(
 )
 $script:loaded = @{}
 
+# ----- XMP support by file type -----
+$script:xmpEmbedded = @('jpg','jpeg','jpe','tif','tiff','png','dng','psd','webp','heic','heif','avif','gif','jp2','j2k','pdf','mp4','m4v','mov','ai','eps','indd','xmp')
+$script:xmpSidecar  = @('raf','cr2','cr3','crw','nef','nrw','arw','sr2','srf','orf','rw2','pef','srw','x3f','3fr','erf','kdc','mrw','raw','dcr','iiq','rwl','gpr')
+$script:emptyXmp = '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>' + "`n" +
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta>' + "`n" +
+    '<?xpacket end="w"?>'
+
+function Get-XmpMode($it) {
+    if ($it.IsDir) { return $null }
+    $x = [IO.Path]::GetExtension($it.Name).TrimStart('.').ToLower()
+    if ($script:xmpEmbedded -contains $x) { return 'embedded' }
+    if ($script:xmpSidecar -contains $x) { return 'sidecar' }
+    return $null
+}
+function Get-MetaTarget($it) {
+    if ((Get-XmpMode $it) -eq 'sidecar') { return [IO.Path]::ChangeExtension($it.FullPath, 'xmp') }
+    return $it.FullPath
+}
+function Get-Targets($sel) {
+    return @($sel | ForEach-Object { Get-MetaTarget $_ } | Sort-Object -Unique)
+}
+
 function Show-Metadata {
-    $jpgs = @($list.SelectedItems | Where-Object { $_.IsJpg })
+    $all = @($list.SelectedItems)
+    $sel = @($all | Where-Object { Get-XmpMode $_ })
     $script:loaded = @{}
-    $on = ($jpgs.Count -gt 0)
+    $on = ($sel.Count -gt 0)
     foreach ($f in $fields) {
         $f.Ctl.Text = ''
         $f.Ctl.Background = [Windows.Media.Brushes]::White
@@ -287,15 +311,35 @@ function Show-Metadata {
         $f.Ctl.IsEnabled = $on
     }
     $btnSave.IsEnabled = $on
+
+    # note in the system info box
+    $files = @($all | Where-Object { -not $_.IsDir })
+    if ($files.Count -gt 0) {
+        $nEmb  = @($sel | Where-Object { (Get-XmpMode $_) -eq 'embedded' }).Count
+        $nSide = @($sel | Where-Object { (Get-XmpMode $_) -eq 'sidecar' }).Count
+        $nNo   = $files.Count - $sel.Count
+        $parts = @()
+        if ($nEmb  -gt 0) { $parts += "$nEmb embedded" }
+        if ($nSide -gt 0) { $parts += "$nSide in .xmp sidecar" }
+        if ($nNo   -gt 0) { $parts += "$nNo not supported" }
+        $sysInfo.Text = $sysInfo.Text + "`nXMP: " + ($parts -join ', ')
+    }
     if (-not $on) { return }
 
-    $cmd = @('-j', '-charset', 'filename=utf8')
-    foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
-    foreach ($j in $jpgs) { $cmd += $j.FullPath }
-    $json = $script:et.Run([string[]]$cmd)
-
+    $readPaths = @()
+    $missing = 0
+    foreach ($tp in (Get-Targets $sel)) {
+        if ([IO.File]::Exists($tp)) { $readPaths += $tp } else { $missing++ }
+    }
     $objs = @()
-    if ($json.Trim()) { $parsed = ConvertFrom-Json $json; $objs += $parsed }
+    if ($readPaths.Count -gt 0) {
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += $readPaths
+        $json = $script:et.Run([string[]]$cmd)
+        if ($json.Trim()) { $parsed = ConvertFrom-Json $json; $objs += $parsed }
+    }
+    for ($i = 0; $i -lt $missing; $i++) { $objs += [pscustomobject]@{} }
 
     foreach ($f in $fields) {
         $vals = @()
@@ -319,8 +363,9 @@ function Show-Metadata {
 }
 
 function Save-Metadata {
-    $jpgs = @($list.SelectedItems | Where-Object { $_.IsJpg })
-    if ($jpgs.Count -eq 0) { return }
+    $all = @($list.SelectedItems | Where-Object { -not $_.IsDir })
+    $sel = @($all | Where-Object { Get-XmpMode $_ })
+    if ($sel.Count -eq 0) { return }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $changes = @()
     foreach ($f in $fields) {
@@ -337,22 +382,43 @@ function Save-Metadata {
             $changes += ('-' + $f.Tag + '=' + $new)
         }
     }
-    if ($changes.Count -eq 0) { $txtStatus.Text = 'No changes to save.'; return }
+    if ($changes.Count -eq 0) {
+        $txtStatus.Text = 'No changes to save.'
+        [void][System.Windows.MessageBox]::Show($win, 'No changes detected. Edit a field first.', 'MetadataEditor')
+        return
+    }
+
+    # create any missing sidecars
+    $created = 0
+    foreach ($it in $sel) {
+        if ((Get-XmpMode $it) -eq 'sidecar') {
+            $tp = Get-MetaTarget $it
+            if (-not [IO.File]::Exists($tp)) {
+                [IO.File]::WriteAllText($tp, $script:emptyXmp, (New-Object Text.UTF8Encoding($false)))
+                $created++
+            }
+        }
+    }
 
     $cmd = @('-charset', 'utf8', '-charset', 'filename=utf8', '-P', '-m')
     if (-not $cfg.KeepBackups) { $cmd += '-overwrite_original' }
     $cmd += $changes
-    foreach ($j in $jpgs) { $cmd += $j.FullPath }
+    $cmd += (Get-Targets $sel)
     $out = $script:et.Run([string[]]$cmd)
     $err = $script:et.LastError
     $n = 0
     if ($out -match '(\d+) image files updated') { $n = [int]$Matches[1] }
     $msg = "Saved XMP to $n file(s) in $($sw.ElapsedMilliseconds) ms"
+    if ($created -gt 0) { $msg += " ($created new sidecar file(s))" }
+    $skipped = $all.Count - $sel.Count
+    if ($skipped -gt 0) { $msg += "  |  $skipped unsupported file(s) skipped" }
     if ($err) { $msg += '  |  ' + (($err -split "`n")[0]); Write-Log $err }
-    $txtStatus.Text = $msg
+    $txtStatus.Text = $msg; $script:metaReady = $false
+    Write-Log ("SAVE cmd: " + ($cmd -join " | "))
+    Write-Log ("SAVE out: " + $out)
+    [void][System.Windows.MessageBox]::Show($win, ($msg + "`n`n" + $out + $err), 'MetadataEditor')
     Show-Metadata
 }
-
 # ----- Events -----
 $tree.Add_SelectedItemChanged({
     $n = $tree.SelectedItem
@@ -715,7 +781,244 @@ $win.Add_PreviewKeyDown({
 })
 # ===== END SCRIPT4 =====
 
+# ===== SCRIPT6-MARKER =====
+$txtSearch = $win.FindName('txtSearch')
+if (-not ('ShellThumb' -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class ShellThumb {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SIZE { public int cx; public int cy; }
+
+    [ComImport, Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItemImageFactory {
+        [PreserveSig] int GetImage(SIZE size, int flags, out IntPtr phbm);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void SHCreateItemFromParsingName(string path, IntPtr pbc, [In] ref Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory ppv);
+
+    [DllImport("gdi32.dll")]
+    static extern bool DeleteObject(IntPtr h);
+
+    public static IntPtr Get(string path, int size) {
+        try {
+            Guid iid = new Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b");
+            IShellItemImageFactory f;
+            SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out f);
+            SIZE s; s.cx = size; s.cy = size;
+            IntPtr h;
+            int hr = f.GetImage(s, 8, out h);
+            Marshal.ReleaseComObject(f);
+            if (hr == 0) return h;
+            return IntPtr.Zero;
+        } catch { return IntPtr.Zero; }
+    }
+
+    public static void Delete(IntPtr h) { if (h != IntPtr.Zero) DeleteObject(h); }
+}
+
+public class ShellThumbWorker {
+    private ConcurrentQueue<KeyValuePair<string, IntPtr>> results = new ConcurrentQueue<KeyValuePair<string, IntPtr>>();
+    public volatile bool Done;
+    private volatile bool stop;
+    private Thread th;
+
+    public void Start(string[] paths, int size) {
+        th = new Thread(delegate() {
+            foreach (string p in paths) {
+                if (stop) break;
+                IntPtr h = ShellThumb.Get(p, size);
+                if (h != IntPtr.Zero) results.Enqueue(new KeyValuePair<string, IntPtr>(p, h));
+            }
+            Done = true;
+        });
+        th.SetApartmentState(ApartmentState.STA);
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    public object[] Take() {
+        KeyValuePair<string, IntPtr> kv;
+        if (results.TryDequeue(out kv)) return new object[] { kv.Key, kv.Value };
+        return null;
+    }
+
+    public bool IsEmpty { get { return results.IsEmpty; } }
+    public void Stop() { stop = true; }
+    public void Drain() {
+        KeyValuePair<string, IntPtr> kv;
+        while (results.TryDequeue(out kv)) ShellThumb.Delete(kv.Value);
+    }
+}
+"@
+}
+
+# ---------- Shell thumbnails for non-JPG types ----------
+$script:shellExt = @('png','tif','tiff','psd','webp','pdf','mp4','mov','m4v','heic','heif','avif','gif','bmp')
+$script:shellWorker = $null
+$script:shellMap = @{}
+$shellTimer = New-Object System.Windows.Threading.DispatcherTimer
+$shellTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+
+function Stop-ShellThumbs {
+    $shellTimer.Stop()
+    if ($script:shellWorker) {
+        $script:shellWorker.Stop()
+        $script:shellWorker.Drain()
+        $script:shellWorker = $null
+    }
+    $script:shellMap = @{}
+}
+
+function Start-ShellThumbs($items) {
+    Stop-ShellThumbs
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsJpg) { continue }
+        $x = [IO.Path]::GetExtension($it.Name).TrimStart('.').ToLower()
+        if ($script:shellExt -contains $x) {
+            $paths.Add($it.FullPath)
+            $script:shellMap[$it.FullPath] = $it
+        }
+    }
+    if ($paths.Count -eq 0) { return }
+    $w = New-Object ShellThumbWorker
+    $script:shellWorker = $w
+    $w.Start($paths.ToArray(), 160)
+    $shellTimer.Start()
+}
+
+$shellTimer.Add_Tick({
+    try {
+        $w = $script:shellWorker
+        if (-not $w) { $shellTimer.Stop(); return }
+        while ($null -ne ($r = $w.Take())) {
+            try {
+                $path = [string]$r[0]
+                $bmp = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHBitmap($r[1], [IntPtr]::Zero, [System.Windows.Int32Rect]::Empty, [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+                $bmp.Freeze()
+                [ShellThumb]::Delete($r[1])
+                $it = $script:shellMap[$path]
+                if ($it) { $it.Thumb = $bmp }
+            } catch { }
+        }
+        if ($w.Done -and $w.IsEmpty) { $shellTimer.Stop() }
+    } catch { }
+})
+
+# ---------- Search (file names + XMP fields, current folder) ----------
+$script:searchTerms = @()
+$script:metaText = @{}
+$script:metaReady = $false
+$txtSearch.ToolTip = 'Search file names and XMP (Title, Subject, Authors, Tags, Comments). Esc clears.'
+
+function Build-MetaIndex {
+    $script:metaText = @{}
+    $byKey = @{}
+    foreach ($it in @($list.ItemsSource)) {
+        if ($it.IsDir -or -not (Get-XmpMode $it)) { continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $byKey[$tp.ToLowerInvariant()] = @{ Item = $it; Path = $tp } }
+    }
+    $all = @($byKey.Values | ForEach-Object { $_.Path })
+    for ($i = 0; $i -lt $all.Count; $i += 150) {
+        $chunk = @($all[$i..([Math]::Min($i + 149, $all.Count - 1))])
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += $chunk
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { continue }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $entry = $byKey[$key]
+            if (-not $entry) { continue }
+            $parts = @()
+            foreach ($f in $fields) {
+                $v = $o.($f.Key)
+                if ($null -eq $v) { continue }
+                if ($v -is [array]) { $parts += (@($v | ForEach-Object { "$_" }) -join ' ') } else { $parts += "$v" }
+            }
+            $script:metaText[$entry.Item.FullPath] = ($parts -join ' ').ToLowerInvariant()
+        }
+    }
+    $script:metaReady = $true
+}
+
+$script:searchPredicate = [System.Predicate[object]]{
+    param($o)
+    $name = $o.Name.ToLowerInvariant()
+    $meta = $script:metaText[$o.FullPath]
+    foreach ($term in $script:searchTerms) {
+        if (-not ($name.Contains($term) -or ($meta -and $meta.Contains($term)))) { return $false }
+    }
+    return $true
+}
+
+function Apply-Search {
+    $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+    if (-not $v) { return }
+    $q = $txtSearch.Text.Trim().ToLowerInvariant()
+    if (-not $q) {
+        $script:searchTerms = @()
+        $v.Filter = $null
+        $v.Refresh()
+        if ($script:folderStatus) { $txtStatus.Text = $script:folderStatus }
+        return
+    }
+    $script:searchTerms = @($q -split '\s+' | Where-Object { $_ })
+    if (-not $script:metaReady) {
+        $txtStatus.Text = 'Indexing XMP metadata...'
+        $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+        Build-MetaIndex
+    }
+    $v.Filter = $script:searchPredicate
+    $v.Refresh()
+    $cnt = 0
+    foreach ($x in $v) { $cnt++ }
+    $txtStatus.Text = "$cnt match(es) for '$($txtSearch.Text.Trim())'   |   $($script:folderStatus)"
+}
+
+function Reset-Search {
+    $script:metaReady = $false
+    $script:metaText = @{}
+    $script:searchTerms = @()
+    if ($txtSearch.Text) { $txtSearch.Text = '' }
+}
+
+function After-FolderLoad($items) {
+    Start-ShellThumbs $items
+    Reset-Search
+}
+
+$searchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$searchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$searchTimer.Add_Tick({ $searchTimer.Stop(); Apply-Search })
+$txtSearch.Add_TextChanged({ $searchTimer.Stop(); $searchTimer.Start() })
+$txtSearch.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Escape') { $txtSearch.Text = ''; $list.Focus() | Out-Null; $e.Handled = $true }
+    elseif ($e.Key -eq 'Return') { $searchTimer.Stop(); Apply-Search; $e.Handled = $true }
+})
+$win.Add_PreviewKeyDown({
+    param($s, $e)
+    $m = [int][System.Windows.Input.Keyboard]::Modifiers
+    if ($e.Key -eq 'F' -and (($m -band 2) -ne 0)) { $txtSearch.Focus() | Out-Null; $txtSearch.SelectAll(); $e.Handled = $true }
+})
+# ===== END SCRIPT6 =====
+
 $win.ShowDialog() | Out-Null
+
+
+
 
 
 
