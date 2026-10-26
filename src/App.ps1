@@ -38,6 +38,8 @@ public class FileItem : INotifyPropertyChanged {
     public string TagsText { get { return _tagsText; } set { _tagsText = value; Notify("TagsText"); } }
     private string _ratingText;
     public string RatingText { get { return _ratingText; } set { _ratingText = value; Notify("RatingText"); } }
+    private string _cameraText;
+    public string CameraText { get { return _cameraText; } set { _cameraText = value; Notify("CameraText"); } }
     private void Notify(string n) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(n)); }
     public bool IsDir { get; set; }
     public bool IsJpg { get; set; }
@@ -2650,6 +2652,191 @@ function Build-MetaIndex {
 # ---------- Help text ----------
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nOFFICE FILES (docx, xlsx, pptx and similar)`nTitle, Subject, Authors, Tags and Comments are saved as native Office properties, so Word and Windows Explorer show them. Copyright and Rating are not stored in Office files, and the Tags buttons, rating keys and Copy/Paste metadata work on XMP files only.`nIf backups are switched on, a name_original copy is made first. A file that is open in Word cannot be saved - close it first.`n`nPress F1 any time")
 # ===== END SCRIPT12 =====
+# ===== SCRIPT13-MARKER =====
+# ---------- Keyword history ----------
+$script:tagSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+function Add-TagHistory($tags) {
+    foreach ($t in @($tags)) {
+        $s = ([string]$t).Trim()
+        if ($s -and $s.Length -le 80 -and $script:tagSet.Count -lt 3000) { [void]$script:tagSet.Add($s) }
+    }
+}
+
+# load saved history
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st13 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st13 -and $st13.TagHistory) { Add-TagHistory @($st13.TagHistory) }
+    }
+} catch { }
+
+# ---------- Camera (read-only, from EXIF) + learn tags while loading columns ----------
+function Get-AllText($o) {
+    $parts = @()
+    foreach ($f in $fields) { $s = Get-FieldText $o $f.Key; if ($s) { $parts += $s } }
+    $m = Get-FieldText $o 'Model'
+    if ($m) { $parts += $m }
+    return (($parts -join ' ').ToLowerInvariant())
+}
+
+function Set-ItemCols($it, $o) {
+    $it.TitleText   = Get-FieldText $o 'Title'
+    $it.SubjectText = Get-FieldText $o 'Headline'
+    $it.AuthorText  = Get-FieldText $o 'Creator'
+    $it.TagsText    = Get-FieldText $o 'Subject'
+    $r = 0
+    [void][int]::TryParse((Get-FieldText $o 'Rating'), [ref]$r)
+    if ($r -gt 0) { $it.RatingText = ([string][char]0x2605) * [Math]::Min(5, $r) } else { $it.RatingText = '' }
+    $it.CameraText = Get-FieldText $o 'Model'
+    if ($it.TagsText) { Add-TagHistory @($it.TagsText -split '\s*[,;]\s*') }
+}
+
+function Start-ColMeta($items) {
+    Stop-ColMeta
+    $map = @{}
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+    foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+    $lines.Add('-Model')
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud) { continue }
+        $mode = Get-XmpMode $it
+        if (-not $mode) { continue }
+        if ($mode -eq 'office') { $script:offQueue.Enqueue($it); continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $lines.Add($tp) }
+    }
+    if ($script:offQueue.Count -gt 0) { $offTimer.Start() }
+    if ($map.Count -eq 0) { return }
+    $argFile = Join-Path $root 'cache\_cols_args.txt'
+    [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+    $script:colMap = $map
+    $x = New-Object AsyncExif
+    $script:colExif = $x
+    $x.Start($cfg.ExifToolPath, $argFile)
+    $colTimer.Start()
+}
+
+function Update-SavedCols {
+    try {
+        $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir -and (Get-XmpMode $_) })
+        if ($sel.Count -eq 0) { return }
+        foreach ($it in @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' })) {
+            Set-ItemCols $it (Read-OfficeProps $it.FullPath)
+        }
+        $map = @{}
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += '-Model'
+        foreach ($it in @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })) {
+            $tp = Get-MetaTarget $it
+            if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $cmd += $tp }
+        }
+        if ($map.Count -eq 0) { return }
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { return }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $it = $map[$key]
+            if ($it) { Set-ItemCols $it $o }
+        }
+    } catch { Write-Log $_.Exception.ToString() }
+}
+
+# sort by Camera column
+$list.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $h = $e.OriginalSource
+    if ($h -is [System.Windows.Controls.GridViewColumnHeader] -and $h.Role -ne 'Padding' -and "$($h.Content)" -eq 'Camera') {
+        if ($script:sortProp -eq 'CameraText' -and $script:sortDir -eq 'Ascending') { $script:sortDir = 'Descending' }
+        else { $script:sortProp = 'CameraText'; $script:sortDir = 'Ascending' }
+        Apply-Sort
+    }
+})
+
+# ---------- Tag autocomplete popup on the Tags box ----------
+$tagBox = New-Object System.Windows.Controls.ListBox
+$tagBox.MaxHeight = 170
+$tagBox.MinWidth = 160
+$tagBox.BorderBrush = [Windows.Media.Brushes]::Gray
+$tagPopup = New-Object System.Windows.Controls.Primitives.Popup
+$tagPopup.PlacementTarget = $txtTags
+$tagPopup.Placement = 'Bottom'
+$tagPopup.StaysOpen = $false
+$tagPopup.Child = $tagBox
+
+function Accept-Tag([string]$tag) {
+    $t = $txtTags.Text
+    $ci = [Math]::Min($txtTags.CaretIndex, $t.Length)
+    $pre = $t.Substring(0, $ci)
+    $m = [regex]::Match($pre, '[^,;]*$')
+    $ws = ([regex]::Match($m.Value, '^\s*')).Value
+    $post = $t.Substring($ci)
+    $ins = $ws + $tag
+    if ($post.Trim() -eq '') { $ins += ', '; $post = '' }
+    $txtTags.Text = $t.Substring(0, $m.Index) + $ins + $post
+    $txtTags.CaretIndex = $m.Index + $ins.Length
+    $tagPopup.IsOpen = $false
+    $txtTags.Focus() | Out-Null
+}
+
+function Update-TagSuggestions {
+    try {
+        if (-not $txtTags.IsKeyboardFocusWithin -or -not $txtTags.IsEnabled) { $tagPopup.IsOpen = $false; return }
+        $t = $txtTags.Text
+        $ci = [Math]::Min($txtTags.CaretIndex, $t.Length)
+        $tok = ([regex]::Match($t.Substring(0, $ci), '[^,;]*$')).Value.Trim()
+        if ($tok.Length -lt 1) { $tagPopup.IsOpen = $false; return }
+        $have = @($t -split '\s*[,;]\s*' | ForEach-Object { $_.Trim().ToLowerInvariant() })
+        $m = @($script:tagSet | Where-Object { $_.StartsWith($tok, [StringComparison]::OrdinalIgnoreCase) -and ($have -notcontains $_.ToLowerInvariant()) } | Sort-Object | Select-Object -First 8)
+        if ($m.Count -eq 0) { $tagPopup.IsOpen = $false; return }
+        $tagBox.ItemsSource = [string[]]$m
+        $tagBox.SelectedIndex = -1
+        $tagBox.MinWidth = [Math]::Max(160, $txtTags.ActualWidth)
+        $tagPopup.IsOpen = $true
+    } catch { }
+}
+
+$txtTags.Add_TextChanged({ Update-TagSuggestions })
+$txtTags.Add_LostKeyboardFocus({ if (-not $tagBox.IsMouseOver) { $tagPopup.IsOpen = $false } })
+$txtTags.Add_PreviewKeyDown({
+    param($s, $e)
+    if (-not $tagPopup.IsOpen) { return }
+    $k = "$($e.Key)"
+    if ($k -eq 'Down') {
+        $i = $tagBox.SelectedIndex + 1
+        if ($i -ge $tagBox.Items.Count) { $i = 0 }
+        $tagBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Up') {
+        $i = $tagBox.SelectedIndex - 1
+        if ($i -lt 0) { $i = $tagBox.Items.Count - 1 }
+        $tagBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Tab' -or $k -eq 'Return') {
+        $tag = $tagBox.SelectedItem
+        if (-not $tag -and $k -eq 'Tab' -and $tagBox.Items.Count -gt 0) { $tag = $tagBox.Items[0] }
+        if ($tag) { Accept-Tag ([string]$tag); $e.Handled = $true }
+    }
+    elseif ($k -eq 'Escape') { $tagPopup.IsOpen = $false; $e.Handled = $true }
+})
+$tagBox.Add_PreviewMouseLeftButtonUp({
+    if ($tagBox.SelectedItem) { Accept-Tag ([string]$tagBox.SelectedItem) }
+})
+
+# ---------- Save history on exit ----------
+$win.Add_Closing({
+    try { Set-Setting 'TagHistory' ([string[]]@($script:tagSet | Sort-Object)) } catch { }
+})
+
+# ---------- Help text ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nKEYWORD HISTORY AND CAMERA`nAs you type in the Tags box, matching tags you have used before pop up. Use Up/Down then Enter or Tab (Tab takes the first one), or click one. History is learned from every folder you browse and every tag you save.`nThe Camera column (Details view) shows the camera model from the photo EXIF. It is read-only, sortable and searchable.`n`nPress F1 any time")
+# ===== END SCRIPT13 =====
 $win.ShowDialog() | Out-Null
 
 

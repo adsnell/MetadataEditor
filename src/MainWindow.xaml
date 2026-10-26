@@ -39,6 +39,7 @@
       <GridViewColumn Header="Author" Width="140" DisplayMemberBinding="{Binding AuthorText}"/>
       <GridViewColumn Header="Tags" Width="220" DisplayMemberBinding="{Binding TagsText}"/>
       <GridViewColumn Header="Rating" Width="70" DisplayMemberBinding="{Binding RatingText}"/>
+      <GridViewColumn Header="Camera" Width="110" DisplayMemberBinding="{Binding CameraText}"/>
       <GridViewColumn Header="Folder" Width="0" DisplayMemberBinding="{Binding FolderText}"/>
     </GridView>
     <ItemsPanelTemplate x:Key="tilePanel"><WrapPanel/></ItemsPanelTemplate>
