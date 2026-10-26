@@ -36,6 +36,8 @@ public class FileItem : INotifyPropertyChanged {
     public string SubjectText { get { return _subjectText; } set { _subjectText = value; Notify("SubjectText"); } }
     public string AuthorText { get { return _authorText; } set { _authorText = value; Notify("AuthorText"); } }
     public string TagsText { get { return _tagsText; } set { _tagsText = value; Notify("TagsText"); } }
+    private string _ratingText;
+    public string RatingText { get { return _ratingText; } set { _ratingText = value; Notify("RatingText"); } }
     private void Notify(string n) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(n)); }
     public bool IsDir { get; set; }
     public bool IsJpg { get; set; }
@@ -401,7 +403,7 @@ function Save-Metadata {
     }
     if ($changes.Count -eq 0) {
         $txtStatus.Text = 'No changes to save.'
-        [void][System.Windows.MessageBox]::Show($win, 'No changes detected. Edit a field first.', 'MetadataEditor')
+        # (popup removed - status bar only)
         return
     }
 
@@ -425,7 +427,7 @@ function Save-Metadata {
     $err = $script:et.LastError
     $n = 0
     if ($out -match '(\d+) image files updated') { $n = [int]$Matches[1] }
-    $msg = "Saved XMP to $n file(s) in $($sw.ElapsedMilliseconds) ms"
+    $msg = "Saved " + (Get-ChangedNames $changes) + " to $n file(s) in $($sw.ElapsedMilliseconds) ms"
     if ($created -gt 0) { $msg += " ($created new sidecar file(s))" }
     $skipped = $all.Count - $sel.Count
     if ($skipped -gt 0) { $msg += "  |  $skipped unsupported file(s) skipped" }
@@ -433,7 +435,7 @@ function Save-Metadata {
     $txtStatus.Text = $msg; $script:metaReady = $false; Update-SavedCols
     Write-Log ("SAVE cmd: " + ($cmd -join " | "))
     Write-Log ("SAVE out: " + $out)
-    [void][System.Windows.MessageBox]::Show($win, ($msg + "`n`n" + $out + $err), 'MetadataEditor')
+    # (popup removed - result is shown in the status bar)
     Show-Metadata
 }
 # ----- Events -----
@@ -2010,6 +2012,265 @@ $win.Add_Closing({
 
 Set-TileResources
 # ===== END SCRIPT9 =====
+# ===== SCRIPT11-MARKER =====
+$btnHelp      = $win.FindName('btnHelp')
+$btnTagAdd    = $win.FindName('btnTagAdd')
+$btnTagRemove = $win.FindName('btnTagRemove')
+$btnCrUse     = $win.FindName('btnCrUse')
+$btnCrSet     = $win.FindName('btnCrSet')
+$script:crPreset = ''
+$script:metaClip = @()
+
+function Set-Setting($name, $value) {
+    try {
+        $o = $null
+        if ([IO.File]::Exists($settingsFile)) { $o = Get-Content $settingsFile -Raw | ConvertFrom-Json }
+        if (-not $o) { $o = [pscustomobject]@{} }
+        if ($o.PSObject.Properties[$name]) { $o.$name = $value } else { $o | Add-Member -NotePropertyName $name -NotePropertyValue $value }
+        $o | ConvertTo-Json | Set-Content $settingsFile -Encoding UTF8
+    } catch { }
+}
+
+function Get-ChangedNames($changes) {
+    $map = @{ Title = 'Title'; Headline = 'Subject'; Creator = 'Authors'; Subject = 'Tags'; Description = 'Comments'; Rights = 'Copyright'; Rating = 'Rating' }
+    $names = @()
+    foreach ($c in @($changes)) {
+        $t = ([string]$c).TrimStart('-')
+        if ($t -match '^[^:=+]*:([A-Za-z]+)') { $k = $Matches[1]; if ($map.ContainsKey($k)) { $names += $map[$k] } }
+    }
+    $names = @($names | Select-Object -Unique)
+    if ($names.Count -eq 0) { return 'XMP' }
+    return ($names -join ', ')
+}
+
+function Get-SelXmp { @($list.SelectedItems | Where-Object { -not $_.IsDir -and (Get-XmpMode $_) }) }
+
+# ---------- Generic XMP write (rating, tags, paste metadata) - result goes to the status bar ----------
+function Invoke-XmpWrite($sel, $changes, $label) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    foreach ($it in $sel) {
+        if ((Get-XmpMode $it) -eq 'sidecar') {
+            $tp = Get-MetaTarget $it
+            if (-not [IO.File]::Exists($tp)) { [IO.File]::WriteAllText($tp, $script:emptyXmp, (New-Object Text.UTF8Encoding($false))) }
+        }
+    }
+    $cmd = @('-charset', 'utf8', '-charset', 'filename=utf8', '-P', '-m')
+    if (-not $cfg.KeepBackups) { $cmd += '-overwrite_original' }
+    $cmd += $changes
+    $cmd += (Get-Targets $sel)
+    $out = $script:et.Run([string[]]$cmd)
+    $err = $script:et.LastError
+    $n = 0
+    if ($out -match '(\d+) image files updated') { $n = [int]$Matches[1] }
+    $msg = "$label $n file(s) in $($sw.ElapsedMilliseconds) ms"
+    if ($n -eq 0 -and -not $err) { $msg += '  |  nothing changed' }
+    if ($err) { $msg += '  |  ' + (($err -split "`n")[0]); Write-Log $err }
+    Write-Log ('XMPWRITE cmd: ' + ($cmd -join ' | '))
+    $script:metaReady = $false
+    Update-SavedCols
+    Show-Metadata
+    $txtStatus.Text = $msg
+}
+
+# ---------- Rating keys 1-5 (0 clears) ----------
+function Set-Rating([int]$n) {
+    $sel = @(Get-SelXmp)
+    if ($sel.Count -eq 0) { $txtStatus.Text = 'Select one or more files first.'; return }
+    if ($n -eq 0) { $ch = @('-XMP-xmp:Rating='); $what = 'Cleared rating on' }
+    else { $ch = @("-XMP-xmp:Rating=$n"); $what = "Set rating to $n on" }
+    Invoke-XmpWrite $sel $ch $what
+}
+
+# ---------- Bulk add / remove tags ----------
+function Do-TagEdit([string]$mode) {
+    $sel = @(Get-SelXmp)
+    if ($sel.Count -eq 0) { $txtStatus.Text = 'Select one or more files first.'; return }
+    if ($mode -eq 'add') { $ttl = 'Add tags'; $prm = "Tags to ADD to $($sel.Count) file(s) (separate with commas):" }
+    else { $ttl = 'Remove tags'; $prm = "Tags to REMOVE from $($sel.Count) file(s) (separate with commas):" }
+    $txt = Read-Input $ttl $prm ''
+    if ([string]::IsNullOrWhiteSpace($txt)) { return }
+    $tags = @($txt -split '\s*[,;]\s*' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($tags.Count -eq 0) { return }
+    $op = if ($mode -eq 'add') { '+=' } else { '-=' }
+    $ch = @()
+    foreach ($t in $tags) { $ch += ('-XMP-dc:Subject' + $op + $t) }
+    $tagText = $tags -join ', '
+    $label = if ($mode -eq 'add') { "Added tag(s) $tagText to" } else { "Removed tag(s) $tagText from" }
+    Invoke-XmpWrite $sel $ch $label
+}
+
+# ---------- Copyright preset ----------
+function Do-CrSet {
+    $v = Read-Input 'Copyright preset' 'Copyright text to use as your preset:' $script:crPreset
+    if ($null -eq $v) { return }
+    $script:crPreset = ([string]$v).Trim()
+    Set-Setting 'CopyrightPreset' $script:crPreset
+    $txtStatus.Text = "Copyright preset saved: $($script:crPreset)"
+}
+function Do-CrUse {
+    if (-not $script:crPreset) { Do-CrSet; if (-not $script:crPreset) { return } }
+    if (-not $txtCopyright.IsEnabled) { $txtStatus.Text = 'Select a file that supports XMP first.'; return }
+    $txtCopyright.Text = $script:crPreset
+    $txtStatus.Text = 'Copyright preset inserted - press Save (Ctrl+S) to write it to the selected file(s).'
+}
+
+# ---------- Copy metadata from one file, paste to others ----------
+function Do-MetaCopy {
+    $sel = @(Get-SelXmp)
+    if ($sel.Count -ne 1) { $txtStatus.Text = 'Select exactly one file to copy metadata from.'; return }
+    $tp = Get-MetaTarget $sel[0]
+    if (-not [IO.File]::Exists($tp)) { $txtStatus.Text = 'That file has no XMP metadata yet.'; return }
+    $cmd = @('-j', '-charset', 'filename=utf8')
+    foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+    $cmd += $tp
+    $json = $script:et.Run([string[]]$cmd)
+    if (-not $json.Trim()) { $txtStatus.Text = 'Could not read metadata.'; return }
+    $o = @(ConvertFrom-Json $json)[0]
+    $clip = @()
+    $keys = @()
+    foreach ($f in $fields) {
+        $v = $o.($f.Key)
+        if ($null -eq $v -or "$v" -eq '') { continue }
+        if ($v -is [array]) { $its = @($v | ForEach-Object { ("$_" -replace '[\r\n]+', ' ') }) } else { $its = @(("$v" -replace '[\r\n]+', ' ')) }
+        $clip += @{ Tag = $f.Tag; Items = $its }
+        $keys += ('-' + $f.Tag)
+    }
+    $script:metaClip = $clip
+    if ($clip.Count -eq 0) { $txtStatus.Text = "No metadata found on $($sel[0].Name) to copy."; return }
+    $txtStatus.Text = "Copied metadata from $($sel[0].Name): " + (Get-ChangedNames $keys) + '  (right-click other files > Paste metadata)'
+}
+function Do-MetaPaste {
+    if ($script:metaClip.Count -eq 0) { $txtStatus.Text = 'Nothing copied yet. Right-click a file > Copy metadata first.'; return }
+    $sel = @(Get-SelXmp)
+    if ($sel.Count -eq 0) { $txtStatus.Text = 'Select one or more files to paste metadata onto.'; return }
+    $ch = @()
+    foreach ($c in $script:metaClip) { foreach ($i in $c.Items) { $ch += ('-' + $c.Tag + '=' + $i) } }
+    Invoke-XmpWrite $sel $ch ('Pasted ' + (Get-ChangedNames $ch) + ' to')
+}
+
+# ---------- Rating column in Details ----------
+function Set-ItemCols($it, $o) {
+    $it.TitleText   = Get-FieldText $o 'Title'
+    $it.SubjectText = Get-FieldText $o 'Headline'
+    $it.AuthorText  = Get-FieldText $o 'Creator'
+    $it.TagsText    = Get-FieldText $o 'Subject'
+    $r = 0
+    [void][int]::TryParse((Get-FieldText $o 'Rating'), [ref]$r)
+    if ($r -gt 0) { $it.RatingText = ([string][char]0x2605) * [Math]::Min(5, $r) } else { $it.RatingText = '' }
+}
+$list.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $h = $e.OriginalSource
+    if ($h -is [System.Windows.Controls.GridViewColumnHeader] -and $h.Role -ne 'Padding' -and "$($h.Content)" -eq 'Rating') {
+        if ($script:sortProp -eq 'RatingText' -and $script:sortDir -eq 'Ascending') { $script:sortDir = 'Descending' }
+        else { $script:sortProp = 'RatingText'; $script:sortDir = 'Ascending' }
+        Apply-Sort
+    }
+})
+
+# ---------- Help ----------
+$script:helpText = (@(
+'METADATAEDITOR - QUICK HELP',
+'',
+'EDITING METADATA',
+'Select one or more files, edit the fields on the right, then press SAVE METADATA or Ctrl+S.',
+'A yellow field means the selected files have different values. Leave it alone to keep each file as it is, or type to set them all.',
+'Only XMP is written. The status bar at the bottom tells you what was done - there are no popups.',
+'',
+'RATINGS',
+'Click a file (or several) and press 1-5 to set the rating at once. Press 0 to clear it.',
+'Details view has a Rating column (click the header to sort).',
+'',
+'TAGS',
+'+ Add tags / - Remove tags (under the Tags box) add or remove tags on ALL selected files, keeping each file''s other tags.',
+'Tag names must match exactly when removing.',
+'',
+'COPYRIGHT',
+'Set preset... stores your copyright text. Insert preset puts it in the Copyright box - then Save.',
+'',
+'COPY METADATA BETWEEN FILES',
+'Right-click a file > Copy metadata. Select other files > right-click > Paste metadata.',
+'Only fields that have a value are copied, and they replace the same fields on the target files.',
+'',
+'VIEWS AND SEARCH',
+'Details or Thumbnails - your choice is remembered. Thumbnail size: slider or Ctrl + mouse wheel.',
+'Search box (top right) looks in file names and XMP. Tick Subfolders to search below the current folder.',
+'',
+'FILES',
+'Double-click or Enter opens a file. F2 renames. Delete sends to the Recycle Bin. F5 refreshes.',
+'Alt+Left / Alt+Right go back and forward. Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste files.',
+'Online-only OneDrive files are skipped for previews so nothing is downloaded.',
+'',
+'Press F1 any time to open this help. Esc closes it.'
+) -join "`n")
+
+function Show-Help {
+    $w = New-Object System.Windows.Window
+    $w.Title = 'MetadataEditor - Help'
+    $w.Width = 640; $w.Height = 700
+    $w.Owner = $win; $w.WindowStartupLocation = 'CenterOwner'
+    $sv = New-Object System.Windows.Controls.ScrollViewer
+    $sv.VerticalScrollBarVisibility = 'Auto'
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $script:helpText
+    $tb.TextWrapping = 'Wrap'
+    $tb.FontSize = 14
+    $tb.Margin = [System.Windows.Thickness]::new(18)
+    $sv.Content = $tb
+    $w.Content = $sv
+    $w.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+    [void]$w.ShowDialog()
+}
+
+# ---------- Wiring ----------
+$btnHelp.Add_Click({ Show-Help })
+$btnTagAdd.Add_Click({ Do-TagEdit 'add' })
+$btnTagRemove.Add_Click({ Do-TagEdit 'remove' })
+$btnCrUse.Add_Click({ Do-CrUse })
+$btnCrSet.Add_Click({ Do-CrSet })
+
+function New-MenuItem($header, $action) {
+    $mi = New-Object System.Windows.Controls.MenuItem
+    $mi.Header = $header
+    $mi.Add_Click($action)
+    return $mi
+}
+$cm.Items.Insert(4, (New-Object System.Windows.Controls.Separator))
+$cm.Items.Insert(5, (New-MenuItem 'Copy metadata' { Do-MetaCopy }))
+$cm.Items.Insert(6, (New-MenuItem 'Paste metadata' { Do-MetaPaste }))
+
+function Update-ActionButtons {
+    $on = (@(Get-SelXmp).Count -gt 0)
+    foreach ($b in @($btnTagAdd, $btnTagRemove, $btnCrUse)) { $b.IsEnabled = $on }
+}
+$list.Add_SelectionChanged({ Update-ActionButtons })
+Update-ActionButtons
+
+$win.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'F1') { Show-Help; $e.Handled = $true; return }
+    if ($e.OriginalSource -is [System.Windows.Controls.TextBox]) { return }
+    if (-not $list.IsKeyboardFocusWithin) { return }
+    if ([int][System.Windows.Input.Keyboard]::Modifiers -ne 0) { return }
+    if ("$($e.Key)" -match '^(D|NumPad)([0-5])$') { Set-Rating ([int]$Matches[2]); $e.Handled = $true }
+})
+
+# ---------- Remember view + copyright preset ----------
+$st11 = $null
+if ([IO.File]::Exists($settingsFile)) { try { $st11 = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch { } }
+if ($st11) {
+    if ($st11.CopyrightPreset) { $script:crPreset = [string]$st11.CopyrightPreset }
+    if ($st11.ViewMode -eq 'Thumbnails') { $rbThumbs.IsChecked = $true }
+}
+$win.Add_Closing({
+    try {
+        $vm = 'Details'
+        if ($rbThumbs.IsChecked) { $vm = 'Thumbnails' }
+        Set-Setting 'ViewMode' $vm
+        Set-Setting 'CopyrightPreset' $script:crPreset
+    } catch { }
+})
+# ===== END SCRIPT11 =====
 $win.ShowDialog() | Out-Null
 
 
