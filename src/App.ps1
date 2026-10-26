@@ -2271,6 +2271,385 @@ $win.Add_Closing({
     } catch { }
 })
 # ===== END SCRIPT11 =====
+# ===== SCRIPT12-MARKER =====
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+
+# ---------- m4a: embedded XMP ----------
+$script:xmpEmbedded += 'm4a'
+
+# ---------- Office files: native document properties (docProps/core.xml) ----------
+$script:officeExt = @('docx', 'xlsx', 'pptx', 'docm', 'xlsm', 'pptm', 'dotx', 'xltx', 'potx')
+$script:nsDc = 'http://purl.org/dc/elements/1.1/'
+$script:nsCp = 'http://schemas.openxmlformats.org/package/2006/metadata/core-properties'
+$script:officeMap = @{ Title = @('dc', 'title'); Headline = @('dc', 'subject'); Creator = @('dc', 'creator'); Subject = @('cp', 'keywords'); Description = @('dc', 'description') }
+
+function Get-XmpMode($it) {
+    if ($it.IsDir) { return $null }
+    $x = [IO.Path]::GetExtension($it.Name).TrimStart('.').ToLowerInvariant()
+    if ($script:xmpEmbedded -contains $x) { return 'embedded' }
+    if ($script:xmpSidecar -contains $x) { return 'sidecar' }
+    if ($script:officeExt -contains $x) { return 'office' }
+    return $null
+}
+
+function Get-SelXmp {
+    @($list.SelectedItems | Where-Object {
+        if ($_.IsDir) { return $false }
+        $m = Get-XmpMode $_
+        return ($m -eq 'embedded' -or $m -eq 'sidecar')
+    })
+}
+
+function Read-OfficeProps([string]$path) {
+    $r = @{}
+    $fs = $null; $za = $null
+    try {
+        $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $za = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Read)
+        $e = $za.GetEntry('docProps/core.xml')
+        if ($e) {
+            $sr = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8)
+            $txt = $sr.ReadToEnd()
+            $sr.Dispose()
+            $doc = New-Object Xml.XmlDocument
+            $doc.LoadXml($txt)
+            foreach ($n in $doc.DocumentElement.ChildNodes) {
+                switch ($n.LocalName) {
+                    'title'       { $r['Title'] = $n.InnerText }
+                    'subject'     { $r['Headline'] = $n.InnerText }
+                    'creator'     { $r['Creator'] = $n.InnerText }
+                    'description' { $r['Description'] = $n.InnerText }
+                    'keywords'    { $r['Subject'] = ((@($n.InnerText -split '\s*[;,]\s*' | Where-Object { $_ })) -join ', ') }
+                }
+            }
+        }
+    }
+    catch { Write-Log ('Office read failed: ' + $path + ' ' + $_.Exception.Message) }
+    finally {
+        if ($za) { $za.Dispose() }
+        if ($fs) { $fs.Dispose() }
+    }
+    return $r
+}
+
+function Write-OfficeProps([string]$path, [hashtable]$vals) {
+    $lw = [IO.File]::GetLastWriteTime($path)
+    $fs = $null; $za = $null
+    try {
+        $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $za = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Update)
+        $e = $za.GetEntry('docProps/core.xml')
+        if (-not $e) { throw 'This file has no core properties part (docProps/core.xml).' }
+        $s = $e.Open()
+        $sr = New-Object IO.StreamReader($s, [Text.Encoding]::UTF8, $true, 1024, $true)
+        $txt = $sr.ReadToEnd()
+        $sr.Dispose()
+        $doc = New-Object Xml.XmlDocument
+        $doc.PreserveWhitespace = $true
+        $doc.LoadXml($txt)
+        $root = $doc.DocumentElement
+        foreach ($k in @($vals.Keys)) {
+            $m = $script:officeMap[$k]
+            if (-not $m) { continue }
+            if ($m[0] -eq 'dc') { $ns = $script:nsDc } else { $ns = $script:nsCp }
+            $val = [string]$vals[$k]
+            $node = $null
+            foreach ($c in $root.ChildNodes) {
+                if ($c.LocalName -eq $m[1] -and $c.NamespaceURI -eq $ns) { $node = $c; break }
+            }
+            if ($val -eq '') {
+                if ($node) { [void]$root.RemoveChild($node) }
+            } else {
+                if (-not $node) { $node = $doc.CreateElement($m[0], $m[1], $ns); [void]$root.AppendChild($node) }
+                $node.InnerText = $val
+            }
+        }
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($doc.OuterXml)
+        $s.Position = 0
+        $s.SetLength(0)
+        $s.Write($bytes, 0, $bytes.Length)
+        $s.Dispose()
+    }
+    finally {
+        if ($za) { $za.Dispose() }
+        if ($fs) { $fs.Dispose() }
+    }
+    [IO.File]::SetLastWriteTime($path, $lw)
+}
+
+# ---------- Metadata panel (XMP files + Office files) ----------
+function Show-Metadata {
+    $all = @($list.SelectedItems)
+    $sel = @($all | Where-Object { Get-XmpMode $_ })
+    $script:loaded = @{}
+    $on = ($sel.Count -gt 0)
+    foreach ($f in $fields) {
+        $f.Ctl.Text = ''
+        $f.Ctl.Background = [Windows.Media.Brushes]::White
+        $f.Ctl.ToolTip = $null
+        $f.Ctl.IsEnabled = $on
+    }
+    $btnSave.IsEnabled = $on
+    $xsel = @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })
+    $osel = @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' })
+    if ($on -and $xsel.Count -eq 0) {
+        foreach ($f in $fields) {
+            if ($f.Key -eq 'Rights' -or $f.Key -eq 'Rating') { $f.Ctl.IsEnabled = $false; $f.Ctl.ToolTip = 'Not stored in Office files' }
+        }
+    }
+    $files = @($all | Where-Object { -not $_.IsDir })
+    if ($files.Count -gt 0) {
+        $nEmb  = @($sel | Where-Object { (Get-XmpMode $_) -eq 'embedded' }).Count
+        $nSide = @($sel | Where-Object { (Get-XmpMode $_) -eq 'sidecar' }).Count
+        $nOff  = $osel.Count
+        $nNo   = $files.Count - $sel.Count
+        $parts = @()
+        if ($nEmb -gt 0)  { $parts += "$nEmb embedded" }
+        if ($nSide -gt 0) { $parts += "$nSide in .xmp sidecar" }
+        if ($nOff -gt 0)  { $parts += "$nOff Office properties" }
+        if ($nNo -gt 0)   { $parts += "$nNo not supported" }
+        $sysInfo.Text = ($sysInfo.Text -replace '\r?\nXMP:[^\r\n]*', '')
+        $sysInfo.Text = $sysInfo.Text + "`nXMP: " + ($parts -join ', ')
+    }
+    if (-not $on) { return }
+
+    $readPaths = @(); $missing = 0
+    foreach ($tp in (Get-Targets $xsel)) {
+        if ([IO.File]::Exists($tp)) { $readPaths += $tp } else { $missing++ }
+    }
+    $objs = @()
+    if ($readPaths.Count -gt 0) {
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += $readPaths
+        $json = $script:et.Run([string[]]$cmd)
+        if ($json.Trim()) { $objs += (ConvertFrom-Json $json) }
+    }
+    for ($i = 0; $i -lt $missing; $i++) { $objs += [pscustomobject]@{} }
+    $oobjs = @()
+    foreach ($it in $osel) { $oobjs += , (Read-OfficeProps $it.FullPath) }
+
+    foreach ($f in $fields) {
+        $src = @($objs)
+        if ($f.Key -ne 'Rights' -and $f.Key -ne 'Rating') { $src = @($objs) + @($oobjs) }
+        $vals = @()
+        foreach ($o in $src) {
+            $v = $o.($f.Key)
+            if ($null -eq $v) { $vals += ''; continue }
+            if ($v -is [array]) { $vals += (@($v | ForEach-Object { "$_" }) -join ', ') } else { $vals += "$v" }
+        }
+        $uniq = @($vals | Select-Object -Unique)
+        if ($uniq.Count -le 1) {
+            $text = ''
+            if ($uniq.Count -eq 1) { $text = [string]$uniq[0] }
+            $f.Ctl.Text = $text
+            $script:loaded[$f.Key] = $text
+        } else {
+            $f.Ctl.Text = ''
+            $script:loaded[$f.Key] = ''
+            $f.Ctl.Background = [Windows.Media.Brushes]::LightYellow
+            $f.Ctl.ToolTip = 'Selected files have different values. Leave empty to keep each, or type to set all.'
+        }
+    }
+}
+
+function Save-Metadata {
+    $all = @($list.SelectedItems | Where-Object { -not $_.IsDir })
+    $sel = @($all | Where-Object { Get-XmpMode $_ })
+    if ($sel.Count -eq 0) { return }
+    $xsel = @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })
+    $osel = @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' })
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $changes = @(); $ochg = @{}; $tags = @()
+    foreach ($f in $fields) {
+        if ($f.Ctl.Text -ceq $script:loaded[$f.Key]) { continue }
+        $new = $f.Ctl.Text.Trim()
+        if ($f.Key -eq 'Rating' -and $new -ne '' -and $new -notmatch '^[0-5]$') {
+            $txtStatus.Text = 'Rating must be a number from 0 to 5 (or empty).'
+            return
+        }
+        $tags += ('-' + $f.Tag)
+        if ($xsel.Count -gt 0) {
+            if ($f.List) {
+                if (-not $new) { $changes += ('-' + $f.Tag + '=') }
+                foreach ($i in @($new -split '\s*[,;]\s*' | Where-Object { $_ })) { $changes += ('-' + $f.Tag + '=' + $i) }
+            } else {
+                $changes += ('-' + $f.Tag + '=' + $new)
+            }
+        }
+        if ($f.Key -ne 'Rights' -and $f.Key -ne 'Rating') {
+            if ($f.Key -eq 'Subject') { $ochg[$f.Key] = ((@($new -split '\s*[,;]\s*' | Where-Object { $_ })) -join '; ') }
+            else { $ochg[$f.Key] = $new }
+        }
+    }
+    if ($tags.Count -eq 0) { $txtStatus.Text = 'No changes to save.'; return }
+
+    # XMP files (ExifTool)
+    $n = 0; $err = ''
+    if ($changes.Count -gt 0 -and $xsel.Count -gt 0) {
+        foreach ($it in $xsel) {
+            if ((Get-XmpMode $it) -eq 'sidecar') {
+                $tp = Get-MetaTarget $it
+                if (-not [IO.File]::Exists($tp)) { [IO.File]::WriteAllText($tp, $script:emptyXmp, (New-Object Text.UTF8Encoding($false))) }
+            }
+        }
+        $cmd = @('-charset', 'utf8', '-charset', 'filename=utf8', '-P', '-m')
+        if (-not $cfg.KeepBackups) { $cmd += '-overwrite_original' }
+        $cmd += $changes
+        $cmd += (Get-Targets $xsel)
+        $out = $script:et.Run([string[]]$cmd)
+        $err = $script:et.LastError
+        if ($out -match '(\d+) image files updated') { $n = [int]$Matches[1] }
+        Write-Log ('SAVE cmd: ' + ($cmd -join ' | '))
+    }
+
+    # Office files (native properties)
+    $no = 0; $oerrs = @()
+    if ($ochg.Count -gt 0) {
+        foreach ($it in $osel) {
+            try {
+                if ($cfg.KeepBackups) {
+                    $bk = $it.FullPath + '_original'
+                    if (-not [IO.File]::Exists($bk)) { [IO.File]::Copy($it.FullPath, $bk) }
+                }
+                Write-OfficeProps $it.FullPath $ochg
+                $no++
+            } catch { $oerrs += ($it.Name + ': ' + $_.Exception.Message) }
+        }
+    }
+
+    $msg = 'Saved ' + (Get-ChangedNames $tags) + " to $($n + $no) file(s) in $($sw.ElapsedMilliseconds) ms"
+    if ($err) { $msg += '  |  ' + (($err -split "`n")[0]); Write-Log $err }
+    if ($oerrs.Count -gt 0) { $msg += '  |  ' + $oerrs[0]; Write-Log ($oerrs -join "`n") }
+    $script:metaReady = $false
+    Update-SavedCols
+    Show-Metadata
+    $txtStatus.Text = $msg
+}
+
+# ---------- Details columns for Office files (read in small batches so the UI stays smooth) ----------
+$script:offQueue = New-Object 'System.Collections.Generic.Queue[object]'
+$offTimer = New-Object System.Windows.Threading.DispatcherTimer
+$offTimer.Interval = [TimeSpan]::FromMilliseconds(30)
+$offTimer.Add_Tick({
+    try {
+        $k = 0
+        while ($k -lt 12 -and $script:offQueue.Count -gt 0) {
+            $it = $script:offQueue.Dequeue()
+            $k++
+            $o = Read-OfficeProps $it.FullPath
+            Set-ItemCols $it $o
+            $script:metaText[$it.FullPath] = (Get-AllText $o)
+        }
+        if ($script:offQueue.Count -eq 0) { $offTimer.Stop() }
+    } catch { $offTimer.Stop(); Write-Log $_.Exception.ToString() }
+})
+
+function Stop-ColMeta {
+    $colTimer.Stop()
+    if ($script:colExif) { $script:colExif.Kill() }
+    $script:colExif = $null
+    $offTimer.Stop()
+    $script:offQueue.Clear()
+}
+
+function Start-ColMeta($items) {
+    Stop-ColMeta
+    $map = @{}
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+    foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud) { continue }
+        $mode = Get-XmpMode $it
+        if (-not $mode) { continue }
+        if ($mode -eq 'office') { $script:offQueue.Enqueue($it); continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $lines.Add($tp) }
+    }
+    if ($script:offQueue.Count -gt 0) { $offTimer.Start() }
+    if ($map.Count -eq 0) { return }
+    $argFile = Join-Path $root 'cache\_cols_args.txt'
+    [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+    $script:colMap = $map
+    $x = New-Object AsyncExif
+    $script:colExif = $x
+    $x.Start($cfg.ExifToolPath, $argFile)
+    $colTimer.Start()
+}
+
+function Update-SavedCols {
+    try {
+        $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir -and (Get-XmpMode $_) })
+        if ($sel.Count -eq 0) { return }
+        foreach ($it in @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' })) {
+            Set-ItemCols $it (Read-OfficeProps $it.FullPath)
+        }
+        $map = @{}
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        foreach ($it in @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })) {
+            $tp = Get-MetaTarget $it
+            if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $cmd += $tp }
+        }
+        if ($map.Count -eq 0) { return }
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { return }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $it = $map[$key]
+            if ($it) { Set-ItemCols $it $o }
+        }
+    } catch { Write-Log $_.Exception.ToString() }
+}
+
+# ---------- Search index (current folder) now includes Office properties ----------
+function Build-MetaIndex {
+    $script:metaText = @{}
+    $byKey = @{}
+    $oitems = @()
+    foreach ($it in @($list.ItemsSource)) {
+        if ($it.IsDir) { continue }
+        $mode = Get-XmpMode $it
+        if (-not $mode) { continue }
+        if ($mode -eq 'office') { if (-not $it.IsCloud) { $oitems += $it }; continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $byKey[$tp.ToLowerInvariant()] = @{ Item = $it; Path = $tp } }
+    }
+    $all = @($byKey.Values | ForEach-Object { $_.Path })
+    for ($i = 0; $i -lt $all.Count; $i += 150) {
+        $chunk = @($all[$i..([Math]::Min($i + 149, $all.Count - 1))])
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += $chunk
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { continue }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $entry = $byKey[$key]
+            if (-not $entry) { continue }
+            $parts = @()
+            foreach ($f in $fields) {
+                $v = $o.($f.Key)
+                if ($null -eq $v) { continue }
+                if ($v -is [array]) { $parts += (@($v | ForEach-Object { "$_" }) -join ' ') } else { $parts += "$v" }
+            }
+            $script:metaText[$entry.Item.FullPath] = ($parts -join ' ').ToLowerInvariant()
+        }
+    }
+    foreach ($it in $oitems) {
+        $script:metaText[$it.FullPath] = (Get-AllText (Read-OfficeProps $it.FullPath))
+    }
+    $script:metaReady = $true
+}
+
+# ---------- Help text ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nOFFICE FILES (docx, xlsx, pptx and similar)`nTitle, Subject, Authors, Tags and Comments are saved as native Office properties, so Word and Windows Explorer show them. Copyright and Rating are not stored in Office files, and the Tags buttons, rating keys and Copy/Paste metadata work on XMP files only.`nIf backups are switched on, a name_original copy is made first. A file that is open in Word cannot be saved - close it first.`n`nPress F1 any time")
+# ===== END SCRIPT12 =====
 $win.ShowDialog() | Out-Null
 
 
