@@ -7,3 +7,5 @@ bin/
 exiftool/
 dist/
 settings.json
+*.zip
+*.bak*

@@ -1889,10 +1889,10 @@ function Set-TileResources {
           <ContentPresenter/>
         </Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#F0F7FF"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#E6F0FB"/><Setter TargetName="bd" Property="BorderBrush" Value="#B8D4F0"/></Trigger>
           <Trigger Property="IsSelected" Value="True">
-            <Setter TargetName="bd" Property="Background" Value="#E3F2FD"/>
-            <Setter TargetName="bd" Property="BorderBrush" Value="#90CAF9"/>
+            <Setter TargetName="bd" Property="Background" Value="#C9E2FB"/>
+            <Setter TargetName="bd" Property="BorderBrush" Value="#1F6FD0"/>
           </Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate>
@@ -2837,6 +2837,183 @@ $win.Add_Closing({
 # ---------- Help text ----------
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nKEYWORD HISTORY AND CAMERA`nAs you type in the Tags box, matching tags you have used before pop up. Use Up/Down then Enter or Tab (Tab takes the first one), or click one. History is learned from every folder you browse and every tag you save.`nThe Camera column (Details view) shows the camera model from the photo EXIF. It is read-only, sortable and searchable.`n`nPress F1 any time")
 # ===== END SCRIPT13 =====
+# ===== SCRIPT14-MARKER =====
+# ---------- "12 of 48 selected" ----------
+$list.Add_SelectionChanged({
+    $sel = @($list.SelectedItems)
+    if ($sel.Count -gt 0) {
+        $b = ($sel | Where-Object { -not $_.IsDir } | Measure-Object Size -Sum).Sum
+        $txtStatus.Text = "$($sel.Count) of $($list.Items.Count) selected ($(Format-Size ([long]$b)))   |   $($script:folderStatus)"
+    }
+})
+
+# ---------- Status bar colours: red = error, amber = hint, green = done ----------
+$script:stBrush = @{
+    err  = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(198, 40, 40)))
+    warn = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(178, 106, 0)))
+    ok   = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(46, 125, 50)))
+    norm = [System.Windows.Media.Brushes]::Black
+}
+$dpdStatus = [System.ComponentModel.DependencyPropertyDescriptor]::FromProperty([System.Windows.Controls.TextBlock]::TextProperty, [System.Windows.Controls.TextBlock])
+$dpdStatus.AddValueChanged($txtStatus, [EventHandler]{
+    try {
+        $t = [string]$txtStatus.Text
+        if ($t -match '(^|\|\s+)(Error|Warning):|^Cannot |Could not|[Ff]ailed|must be a number') { $k = 'err' }
+        elseif ($t -match '^(Select |Nothing copied|No changes|No metadata|That file has no)|nothing changed') { $k = 'warn' }
+        elseif ($t -match '^(Saved |Set rating|Cleared rating|Added tag|Removed tag|Pasted |Copyright preset|Thumbnail cache cleared)') { $k = 'ok' }
+        else { $k = 'norm' }
+        $txtStatus.Foreground = $script:stBrush[$k]
+    } catch { }
+})
+
+# ---------- Unsaved-edit cue: orange Save button + orange border on changed fields ----------
+$bc = New-Object System.Windows.Media.BrushConverter
+$script:cueBorder = $bc.ConvertFromString('#E65100')
+$script:cueClean  = $bc.ConvertFromString('#999999')
+$script:saveBlue  = $bc.ConvertFromString('#1565C0')
+$script:saveOrange = $bc.ConvertFromString('#E65100')
+function Update-DirtyCue {
+    try {
+        $dirty = $false
+        foreach ($f in $fields) {
+            $c = $f.Ctl
+            $d = $false
+            if ($c.IsEnabled) {
+                $old = [string]$script:loaded[$f.Key]
+                if ($c.Text -cne $old) { $d = $true }
+            }
+            if ($d) { $c.BorderBrush = $script:cueBorder; $dirty = $true } else { $c.BorderBrush = $script:cueClean }
+        }
+        if ($dirty -and $btnSave.IsEnabled) {
+            $btnSave.Background = $script:saveOrange
+            $btnSave.Content = 'SAVE CHANGES  (Ctrl+S)'
+        } else {
+            $btnSave.Background = $script:saveBlue
+            $btnSave.Content = 'SAVE METADATA'
+        }
+    } catch { }
+}
+foreach ($f in $fields) { $f.Ctl.Add_TextChanged({ Update-DirtyCue }) }
+$script:origShowMeta14 = ${function:Show-Metadata}
+function Show-Metadata { & $script:origShowMeta14; Update-DirtyCue }
+
+# ---------- Window title shows the current folder ----------
+function Update-WinTitle {
+    try {
+        $p = [string]$txtPath.Text
+        if ($p) {
+            $leaf = [IO.Path]::GetFileName($p.TrimEnd('\'))
+            if (-not $leaf) { $leaf = $p }
+            $win.Title = "$leaf  -  MetadataEditor v2"
+        } else { $win.Title = 'MetadataEditor v2' }
+    } catch { }
+}
+$txtPath.Add_TextChanged({ Update-WinTitle })
+Update-WinTitle
+
+# ---------- Window icon (drawn in code) ----------
+try {
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $bg = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(21, 101, 192))
+    $dc.DrawRoundedRectangle($bg, $null, [System.Windows.Rect]::new(2, 2, 60, 60), 12, 12)
+    $ft = New-Object System.Windows.Media.FormattedText('M', [Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, (New-Object System.Windows.Media.Typeface('Segoe UI')), 40, [System.Windows.Media.Brushes]::White)
+    $ft.SetFontWeight([System.Windows.FontWeights]::Bold)
+    $dc.DrawText($ft, [System.Windows.Point]::new(32 - $ft.Width / 2, 32 - $ft.Height / 2))
+    $dc.Close()
+    $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(64, 64, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($dv)
+    $rtb.Freeze()
+    $win.Icon = $rtb
+} catch { }
+
+# ---------- Remember column widths and pane widths ----------
+$script:mainGrid14 = $tree.Parent.Parent
+$gvDet = $win.FindResource('detailsView')
+$st14 = $null
+if ([IO.File]::Exists($settingsFile)) { try { $st14 = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch { } }
+if ($st14) {
+    try {
+        $cd = $script:mainGrid14.ColumnDefinitions
+        if ($cd.Count -ge 5) {
+            if ($st14.PaneLeft)  { $cd[0].Width = [System.Windows.GridLength]::new([Math]::Max(140, [Math]::Min(600, [double]$st14.PaneLeft))) }
+            if ($st14.PaneRight) { $cd[4].Width = [System.Windows.GridLength]::new([Math]::Max(240, [Math]::Min(600, [double]$st14.PaneRight))) }
+        }
+    } catch { }
+    try {
+        if ($st14.ColWidths) {
+            foreach ($c in $gvDet.Columns) {
+                $hdr = "$($c.Header)"
+                if ($hdr -eq 'Folder') { continue }
+                $p = $st14.ColWidths.PSObject.Properties[$hdr]
+                if ($p) { $v = [double]$p.Value; if ($v -ge 40 -and $v -le 900) { $c.Width = $v } }
+            }
+        }
+    } catch { }
+}
+$win.Add_Closing({
+    try {
+        $h = [ordered]@{}
+        foreach ($c in $gvDet.Columns) {
+            $hdr = "$($c.Header)"
+            if ($hdr -eq 'Folder') { continue }
+            $w = $c.ActualWidth
+            if ($w -lt 20) { $w = $c.Width }
+            if ($w -ge 20) { $h[$hdr] = [int]$w }
+        }
+        if ($h.Count -gt 0) { Set-Setting 'ColWidths' ([pscustomobject]$h) }
+        $cd = $script:mainGrid14.ColumnDefinitions
+        if ($cd[0].ActualWidth -ge 100) { Set-Setting 'PaneLeft' ([int]$cd[0].ActualWidth) }
+        if ($cd[4].ActualWidth -ge 100) { Set-Setting 'PaneRight' ([int]$cd[4].ActualWidth) }
+    } catch { }
+})
+
+# ---------- Thumbnail cache: size cap on start + Clear cache button ----------
+function Get-ThumbCacheBytes {
+    $d = Join-Path $root 'cache\thumbs'
+    $s = (Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    if ($s) { return [long]$s } else { return 0L }
+}
+function Trim-ThumbCache([long]$maxBytes) {
+    $d = Join-Path $root 'cache\thumbs'
+    $total = Get-ThumbCacheBytes
+    if ($total -le $maxBytes) { return }
+    foreach ($x in @(Get-ChildItem $d -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)) {
+        if ($total -le ($maxBytes * 0.7)) { break }
+        $sz = (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $total -= [long]$sz
+    }
+}
+try { Trim-ThumbCache 200MB } catch { }
+
+function Clear-ThumbCache {
+    try {
+        Stop-Thumbs
+        $before = Get-ThumbCacheBytes
+        $d = Join-Path $root 'cache\thumbs'
+        Get-ChildItem $d -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $script:thumbDir = $null
+        $mb = [Math]::Round($before / 1MB, 1)
+        Refresh-Folder
+        $txtStatus.Text = "Thumbnail cache cleared ($mb MB freed) - thumbnails rebuild as you browse"
+    } catch { $txtStatus.Text = 'Error: could not clear cache - ' + $_.Exception.Message }
+}
+$btnClearCache = New-Object System.Windows.Controls.Button
+$btnClearCache.Content = 'Clear cache'
+$btnClearCache.Style = $win.FindResource('TB')
+$btnClearCache.ToolTip = 'Delete cached thumbnails (they rebuild automatically)'
+$btnClearCache.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+$dpTop14 = $rbThumbs.Parent
+$dpTop14.Children.Insert($dpTop14.Children.IndexOf($sizeSlider) + 1, $btnClearCache)
+if ($rbThumbs.IsChecked) { $btnClearCache.Visibility = 'Visible' } else { $btnClearCache.Visibility = 'Collapsed' }
+$rbThumbs.Add_Checked({ $btnClearCache.Visibility = 'Visible' })
+$rbThumbs.Add_Unchecked({ $btnClearCache.Visibility = 'Collapsed' })
+$btnClearCache.Add_Click({ Clear-ThumbCache })
+
+# ---------- Help text ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nPOLISH`nThe Save button turns orange (and changed fields get an orange border) while you have unsaved edits. The status bar shows errors in red, hints in amber and completed actions in green. Column widths and pane sizes are remembered. In Thumbnails view, Clear cache deletes cached thumbnails (they rebuild by themselves; the cache is also trimmed automatically above 200 MB).`n`nPress F1 any time")
+# ===== END SCRIPT14 =====
 $win.ShowDialog() | Out-Null
 
 
