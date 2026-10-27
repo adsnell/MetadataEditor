@@ -40,6 +40,8 @@ public class FileItem : INotifyPropertyChanged {
     public string RatingText { get { return _ratingText; } set { _ratingText = value; Notify("RatingText"); } }
     private string _cameraText;
     public string CameraText { get { return _cameraText; } set { _cameraText = value; Notify("CameraText"); } }
+    private string _copyrightText;
+    public string CopyrightText { get { return _copyrightText; } set { _copyrightText = value; Notify("CopyrightText"); } }
     private void Notify(string n) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(n)); }
     public bool IsDir { get; set; }
     public bool IsJpg { get; set; }
@@ -839,7 +841,7 @@ public static class ShellThumb {
             SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out f);
             SIZE s; s.cx = size; s.cy = size;
             IntPtr h;
-            int hr = f.GetImage(s, 8, out h);
+            string ext = Path.GetExtension(path).ToLowerInvariant(); bool io = (" .pdf .doc .docx .dot .dotx .docm .xls .xlsx .xlsm .xlsb .xlt .xltx .csv .tsv .ppt .pptx .pptm .pps .ppsx .potx .odt .ods .odp .rtf .txt .md .xml .json .zip .7z .rar .exe .dll .ps1 .bat .cmd .log .ini ".IndexOf(" " + ext + " ", StringComparison.Ordinal) >= 0); if (io) isIcon = true; int hr = f.GetImage(s, io ? 4 : 8, out h);
             if (hr != 0) { isIcon = true; hr = f.GetImage(s, 4, out h); }
             Marshal.ReleaseComObject(f);
             if (hr == 0) return h;
@@ -3014,6 +3016,274 @@ $btnClearCache.Add_Click({ Clear-ThumbCache })
 # ---------- Help text ----------
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nPOLISH`nThe Save button turns orange (and changed fields get an orange border) while you have unsaved edits. The status bar shows errors in red, hints in amber and completed actions in green. Column widths and pane sizes are remembered. In Thumbnails view, Clear cache deletes cached thumbnails (they rebuild by themselves; the cache is also trimmed automatically above 200 MB).`n`nPress F1 any time")
 # ===== END SCRIPT14 =====
+# ===== SCRIPT15-MARKER =====
+$script:appVersion = '2.1'
+$script:donateUrl  = 'https://paypal.me/AndrewSnell791'
+
+function Get-AncestorOf($d, [type]$t) {
+    while ($null -ne $d -and -not $t.IsInstanceOfType($d)) {
+        if ($d -is [System.Windows.Media.Visual] -or $d -is [System.Windows.Media.Media3D.Visual3D]) { $d = [System.Windows.Media.VisualTreeHelper]::GetParent($d) }
+        else { $d = [System.Windows.LogicalTreeHelper]::GetParent($d) }
+    }
+    return $d
+}
+
+# ---------- Subject history (for autocomplete) ----------
+$script:subjSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$st15 = $null
+if ([IO.File]::Exists($settingsFile)) { try { $st15 = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch { } }
+if ($st15 -and $st15.SubjectHistory) {
+    foreach ($x in @($st15.SubjectHistory)) { $s = ([string]$x).Trim(); if ($s -and $script:subjSet.Count -lt 2000) { [void]$script:subjSet.Add($s) } }
+}
+
+# ---------- Copyright column (+ learn subjects while columns load) ----------
+$script:origSetItemCols15 = ${function:Set-ItemCols}
+function Set-ItemCols($it, $o) {
+    & $script:origSetItemCols15 $it $o
+    $it.CopyrightText = Get-FieldText $o 'Rights'
+    $s = ([string]$it.SubjectText).Trim()
+    if ($s -and $s.Length -le 120 -and $script:subjSet.Count -lt 2000) { [void]$script:subjSet.Add($s) }
+}
+$list.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $h = $e.OriginalSource
+    if ($h -is [System.Windows.Controls.GridViewColumnHeader] -and $h.Role -ne 'Padding' -and "$($h.Content)" -eq 'Copyright') {
+        if ($script:sortProp -eq 'CopyrightText' -and $script:sortDir -eq 'Ascending') { $script:sortDir = 'Descending' }
+        else { $script:sortProp = 'CopyrightText'; $script:sortDir = 'Ascending' }
+        Apply-Sort
+    }
+})
+
+# ---------- Subject box: same suggestions as Tags ----------
+$subjBox = New-Object System.Windows.Controls.ListBox
+$subjBox.MaxHeight = 170
+$subjBox.MinWidth = 160
+$subjBox.BorderBrush = [Windows.Media.Brushes]::Gray
+$subjPopup = New-Object System.Windows.Controls.Primitives.Popup
+$subjPopup.PlacementTarget = $txtSubject
+$subjPopup.Placement = 'Bottom'
+$subjPopup.StaysOpen = $false
+$subjPopup.Child = $subjBox
+
+function Accept-Subject([string]$s) {
+    $subjPopup.IsOpen = $false
+    $txtSubject.Text = $s
+    $txtSubject.CaretIndex = $s.Length
+    $txtSubject.Focus() | Out-Null
+}
+function Update-SubjectSuggestions {
+    try {
+        if (-not $txtSubject.IsKeyboardFocusWithin -or -not $txtSubject.IsEnabled) { $subjPopup.IsOpen = $false; return }
+        $tok = $txtSubject.Text.Trim()
+        if ($tok.Length -lt 1) { $subjPopup.IsOpen = $false; return }
+        $m = @($script:subjSet | Where-Object { $_.IndexOf($tok, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_ -ine $tok } |
+            Sort-Object @{ Expression = { -not $_.StartsWith($tok, [StringComparison]::OrdinalIgnoreCase) } }, @{ Expression = { $_ } } |
+            Select-Object -First 8)
+        if ($m.Count -eq 0) { $subjPopup.IsOpen = $false; return }
+        $subjBox.ItemsSource = [string[]]$m
+        $subjBox.SelectedIndex = -1
+        $subjBox.MinWidth = [Math]::Max(160, $txtSubject.ActualWidth)
+        $subjPopup.IsOpen = $true
+    } catch { }
+}
+$txtSubject.Add_TextChanged({ Update-SubjectSuggestions })
+$txtSubject.Add_LostKeyboardFocus({ if (-not $subjBox.IsMouseOver) { $subjPopup.IsOpen = $false } })
+$txtSubject.Add_PreviewKeyDown({
+    param($s, $e)
+    if (-not $subjPopup.IsOpen) { return }
+    $k = "$($e.Key)"
+    if ($k -eq 'Down') {
+        $i = $subjBox.SelectedIndex + 1
+        if ($i -ge $subjBox.Items.Count) { $i = 0 }
+        $subjBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Up') {
+        $i = $subjBox.SelectedIndex - 1
+        if ($i -lt 0) { $i = $subjBox.Items.Count - 1 }
+        $subjBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Tab' -or $k -eq 'Return') {
+        $v = $subjBox.SelectedItem
+        if (-not $v -and $k -eq 'Tab' -and $subjBox.Items.Count -gt 0) { $v = $subjBox.Items[0] }
+        if ($v) { Accept-Subject ([string]$v); $e.Handled = $true }
+    }
+    elseif ($k -eq 'Escape') { $subjPopup.IsOpen = $false; $e.Handled = $true }
+})
+$subjBox.Add_PreviewMouseLeftButtonUp({
+    if ($subjBox.SelectedItem) { Accept-Subject ([string]$subjBox.SelectedItem) }
+})
+$win.Add_Closing({
+    try { Set-Setting 'SubjectHistory' ([string[]]@($script:subjSet | Sort-Object)) } catch { }
+})
+
+# ---------- Properties (right-click menu + Alt+Enter) ----------
+function Do-Properties {
+    try {
+        $sel = @($list.SelectedItems)
+        if ($sel.Count -gt 0) { $p = [string]$sel[0].FullPath } else { $p = [string]$txtPath.Text }
+        if (-not $p) { return }
+        $p = $p.TrimEnd('\')
+        $parent = [IO.Path]::GetDirectoryName($p)
+        $leaf = [IO.Path]::GetFileName($p)
+        if (-not $parent -or -not $leaf) { return }
+        $sh = New-Object -ComObject Shell.Application
+        $ns = $sh.NameSpace($parent)
+        if ($ns) {
+            $item = $ns.ParseName($leaf)
+            if ($item) { $item.InvokeVerb('Properties') }
+        }
+        if ($sel.Count -gt 1) { $txtStatus.Text = 'Properties shown for the first selected item.' }
+    } catch { $txtStatus.Text = 'Error: could not open Properties - ' + $_.Exception.Message }
+}
+[void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
+[void]$cm.Items.Add((New-MenuItem 'Properties     Alt+Enter' { Do-Properties }))
+$win.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'System' -and $e.SystemKey -eq 'Return' -and $list.IsKeyboardFocusWithin) { Do-Properties; $e.Handled = $true }
+})
+
+# ---------- Drag and drop: middle pane -> folder in the left pane ----------
+$script:dragStart = $null
+$script:clickPending = $null
+$script:internalDrop = $false
+$script:dropHot = $null
+$script:pendingDrop = $null
+
+$list.Add_PreviewMouseLeftButtonDown({
+    param($s, $e)
+    $script:dragStart = $null
+    $script:clickPending = $null
+    $item = Get-AncestorOf $e.OriginalSource ([System.Windows.Controls.ListViewItem])
+    if ($item) {
+        $script:dragStart = $e.GetPosition($list)
+        # keep a multi-selection intact when you press on one of the selected items (so it can be dragged)
+        if ($e.ClickCount -eq 1 -and $item.IsSelected -and $list.SelectedItems.Count -gt 1 -and ([int][System.Windows.Input.Keyboard]::Modifiers -eq 0)) {
+            $script:clickPending = $item
+            $e.Handled = $true
+        }
+    }
+})
+$list.Add_PreviewMouseLeftButtonUp({
+    param($s, $e)
+    $it = $script:clickPending
+    $script:dragStart = $null
+    $script:clickPending = $null
+    if ($it) { $list.SelectedItems.Clear(); $it.IsSelected = $true; $it.Focus() | Out-Null }
+})
+$list.Add_PreviewMouseMove({
+    param($s, $e)
+    if ($e.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed -or $null -eq $script:dragStart) { return }
+    $p = $e.GetPosition($list)
+    if ([Math]::Abs($p.X - $script:dragStart.X) -lt [System.Windows.SystemParameters]::MinimumHorizontalDragDistance -and [Math]::Abs($p.Y - $script:dragStart.Y) -lt [System.Windows.SystemParameters]::MinimumVerticalDragDistance) { return }
+    $script:dragStart = $null
+    $script:clickPending = $null
+    $paths = @(Get-SelPaths)
+    if ($paths.Count -eq 0) { return }
+    $data = New-Object System.Windows.DataObject
+    $data.SetData([System.Windows.DataFormats]::FileDrop, [string[]]$paths)
+    $script:internalDrop = $false
+    $res = [System.Windows.DragDrop]::DoDragDrop($list, $data, [System.Windows.DragDropEffects]'Copy, Move')
+    if (-not $script:internalDrop -and "$res" -match 'Move') { Refresh-Folder }
+})
+
+function Clear-DropHot {
+    if ($script:dropHot) {
+        try { $script:dropHot.ClearValue([System.Windows.Controls.Control]::BackgroundProperty) } catch { }
+        $script:dropHot = $null
+    }
+}
+function Get-DropEffect($e, $dest, $paths) {
+    $ks = [int]$e.KeyStates
+    if (($ks -band 8) -ne 0) { return 'Copy' }
+    if (($ks -band 4) -ne 0) { return 'Move' }
+    $same = $true
+    try { $same = ([IO.Path]::GetPathRoot($dest) -ieq [IO.Path]::GetPathRoot([string]$paths[0])) } catch { }
+    if ($same) { return 'Move' } else { return 'Copy' }
+}
+
+$tree.AllowDrop = $true
+$tree.Add_DragOver({
+    param($s, $e)
+    $e.Handled = $true
+    $e.Effects = [System.Windows.DragDropEffects]::None
+    try {
+        if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
+        $tvi = Get-AncestorOf $e.OriginalSource ([System.Windows.Controls.TreeViewItem])
+        if (-not $tvi -or -not $tvi.Tag -or -not [IO.Directory]::Exists([string]$tvi.Tag)) { Clear-DropHot; return }
+        $paths = @($e.Data.GetData([System.Windows.DataFormats]::FileDrop))
+        $e.Effects = [System.Windows.DragDropEffects](Get-DropEffect $e ([string]$tvi.Tag) $paths)
+        if ($script:dropHot -ne $tvi) {
+            Clear-DropHot
+            $tvi.Background = [System.Windows.Media.Brushes]::LightSkyBlue
+            $script:dropHot = $tvi
+        }
+    } catch { }
+})
+$tree.Add_DragLeave({ Clear-DropHot })
+$tree.Add_Drop({
+    param($s, $e)
+    $e.Handled = $true
+    try {
+        Clear-DropHot
+        if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
+        $tvi = Get-AncestorOf $e.OriginalSource ([System.Windows.Controls.TreeViewItem])
+        if (-not $tvi -or -not $tvi.Tag) { return }
+        $dest = [string]$tvi.Tag
+        if (-not [IO.Directory]::Exists($dest)) { return }
+        $paths = @($e.Data.GetData([System.Windows.DataFormats]::FileDrop))
+        if ($paths.Count -eq 0) { return }
+        $eff = Get-DropEffect $e $dest $paths
+        $script:internalDrop = $true
+        $e.Effects = [System.Windows.DragDropEffects]$eff
+        $script:pendingDrop = @{ Paths = $paths; Dest = $dest; Move = ($eff -eq 'Move') }
+        [void]$win.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [Action]{
+            $d = $script:pendingDrop
+            $script:pendingDrop = $null
+            if ($d) { Transfer-Items $d.Paths $d.Dest $d.Move }
+        })
+    } catch { $txtStatus.Text = 'Error: drop failed - ' + $_.Exception.Message }
+})
+
+# ---------- Help text + About section ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nDRAG AND DROP`nDrag files or folders from the middle pane onto a folder in the left pane to move them. Hold Ctrl to copy instead (Shift forces a move). Dragging to a folder on another drive copies by default.`n`nPROPERTIES, COPYRIGHT AND SUBJECT`nRight-click > Properties (or Alt+Enter) opens the Windows Properties window. The Copyright column shows the XMP copyright text (click the header to sort). The Subject box suggests earlier subjects as you type, the same way Tags does.`n`nPress F1 any time")
+
+function Show-Help {
+    $w = New-Object System.Windows.Window
+    $w.Title = 'MetadataEditor - Help'
+    $w.Width = 640; $w.Height = 700
+    $w.Owner = $win; $w.WindowStartupLocation = 'CenterOwner'
+    $sv = New-Object System.Windows.Controls.ScrollViewer
+    $sv.VerticalScrollBarVisibility = 'Auto'
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Margin = [System.Windows.Thickness]::new(18)
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $script:helpText
+    $tb.TextWrapping = 'Wrap'
+    $tb.FontSize = 14
+    [void]$sp.Children.Add($tb)
+
+    $ab = New-Object System.Windows.Controls.TextBlock
+    $ab.TextWrapping = 'Wrap'
+    $ab.FontSize = 14
+    $ab.Margin = [System.Windows.Thickness]::new(0, 20, 0, 0)
+    $r = New-Object System.Windows.Documents.Run
+    $r.Text = "ABOUT`nMetadataEditor v$($script:appVersion) - free, with an optional donation.`nIt writes XMP metadata into your original files (the picture or document content is not changed), so back up anything important first. To keep a copy of each file as it was before a change, set KeepBackups to true in config.json (copies end in _original).`nPowered by ExifTool by Phil Harvey (exiftool.org), free software.`nIf this saved you time and you would like to say thanks, an optional $([char]0x00A3)1 is welcome: "
+    [void]$ab.Inlines.Add($r)
+    $link = New-Object System.Windows.Documents.Hyperlink
+    $link.NavigateUri = [Uri]$script:donateUrl
+    [void]$link.Inlines.Add('paypal.me/AndrewSnell791')
+    $link.Add_RequestNavigate({ param($s, $e) try { Start-Process $s.NavigateUri.AbsoluteUri } catch { }; $e.Handled = $true })
+    [void]$ab.Inlines.Add($link)
+    [void]$sp.Children.Add($ab)
+
+    $sv.Content = $sp
+    $w.Content = $sv
+    $w.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+    [void]$w.ShowDialog()
+}
+# ===== END SCRIPT15 =====
 $win.ShowDialog() | Out-Null
 
 

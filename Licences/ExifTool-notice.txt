@@ -1,0 +1,12 @@
+﻿EXIFTOOL NOTICE
+
+MetadataEditor uses ExifTool by Phil Harvey (https://exiftool.org) to read and write
+metadata. A copy of ExifTool is included in the "exiftool" folder of this package.
+
+ExifTool is free software. Copyright Phil Harvey. You can redistribute it and/or
+modify it under the same terms as Perl itself (the Perl Artistic License or the
+GNU General Public License). The licence texts and ExifTool's own documentation are
+available from https://exiftool.org and are part of the ExifTool distribution.
+
+MetadataEditor runs exiftool.exe as a separate program. It is an independent hobby
+project and is not affiliated with or endorsed by Phil Harvey.
