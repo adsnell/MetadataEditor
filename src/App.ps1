@@ -841,7 +841,7 @@ public static class ShellThumb {
             SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out f);
             SIZE s; s.cx = size; s.cy = size;
             IntPtr h;
-            string ext = Path.GetExtension(path).ToLowerInvariant(); bool io = (" .pdf .doc .docx .dot .dotx .docm .xls .xlsx .xlsm .xlsb .xlt .xltx .csv .tsv .ppt .pptx .pptm .pps .ppsx .potx .odt .ods .odp .rtf .txt .md .xml .json .zip .7z .rar .exe .dll .ps1 .bat .cmd .log .ini ".IndexOf(" " + ext + " ", StringComparison.Ordinal) >= 0); if (io) isIcon = true; int hr = f.GetImage(s, io ? 4 : 8, out h);
+            string ext = Path.GetExtension(path).ToLowerInvariant(); if (" .pdf .doc .docx .dot .dotx .docm .rtf .odt .xls .xlsx .xlsm .xlsb .xlt .xltx .ods .csv .tsv .ppt .pptx .pptm .pps .ppsx .potx .odp .txt .log .md .ini .xml .json .zip .7z .rar ".IndexOf(" " + ext + " ", StringComparison.Ordinal) >= 0) { Marshal.ReleaseComObject(f); return IntPtr.Zero; } int hr = f.GetImage(s, 8, out h);
             if (hr != 0) { isIcon = true; hr = f.GetImage(s, 4, out h); }
             Marshal.ReleaseComObject(f);
             if (hr == 0) return h;
@@ -3284,6 +3284,95 @@ function Show-Help {
     [void]$w.ShowDialog()
 }
 # ===== END SCRIPT15 =====
+# ===== SCRIPT16-MARKER =====
+$script:docExts = '.pdf .doc .docx .dot .dotx .docm .rtf .odt .xls .xlsx .xlsm .xlsb .xlt .xltx .ods .csv .tsv .ppt .pptx .pptm .pps .ppsx .potx .odp .txt .log .md .ini .xml .json .zip .7z .rar' -split ' '
+$script:docIconCache = @{}
+
+function Get-DocStyle([string]$ext) {
+    switch -Regex ($ext) {
+        '^\.pdf$'                            { return @('PDF', '#D32F2F') }
+        '^\.(docx?|docm|dotx?|rtf|odt)$'     { return @('DOC', '#1F5FBF') }
+        '^\.(xlsx?|xlsm|xlsb|xltx?|ods)$'    { return @('XLS', '#1E7B45') }
+        '^\.(csv|tsv)$'                      { return @('CSV', '#2E9E5B') }
+        '^\.(pptx?|pptm|pps|ppsx|potx|odp)$' { return @('PPT', '#D2571E') }
+        '^\.(zip|7z|rar)$'                   { return @('ZIP', '#B8860B') }
+        '^\.(txt|log|md|ini)$'               { return @('TXT', '#607D8B') }
+        '^\.(xml|json)$'                     { return @(($ext.TrimStart('.').ToUpper()), '#6A5ACD') }
+        default                              { return @(($ext.TrimStart('.').ToUpper()), '#546E7A') }
+    }
+}
+
+function New-DocIconImage([string]$label, [string]$hex) {
+    $S = 384
+    $bc = New-Object System.Windows.Media.BrushConverter
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $dc.DrawRectangle($bc.ConvertFromString('#EEF2F7'), $null, [System.Windows.Rect]::new(0, 0, $S, $S))
+    $pw = 200; $ph = 260; $fold = 56
+    $x = ($S - $pw) / 2; $y = ($S - $ph) / 2 - 4
+    $pen = New-Object System.Windows.Media.Pen -ArgumentList $bc.ConvertFromString('#B0BAC5'), 3.0
+
+    $g = New-Object System.Windows.Media.StreamGeometry
+    $c = $g.Open()
+    $c.BeginFigure([System.Windows.Point]::new($x, $y), $true, $true)
+    $c.LineTo([System.Windows.Point]::new($x + $pw - $fold, $y), $true, $false)
+    $c.LineTo([System.Windows.Point]::new($x + $pw, $y + $fold), $true, $false)
+    $c.LineTo([System.Windows.Point]::new($x + $pw, $y + $ph), $true, $false)
+    $c.LineTo([System.Windows.Point]::new($x, $y + $ph), $true, $false)
+    $c.Close()
+    $g.Freeze()
+    $dc.DrawGeometry([System.Windows.Media.Brushes]::White, $pen, $g)
+
+    $f = New-Object System.Windows.Media.StreamGeometry
+    $c = $f.Open()
+    $c.BeginFigure([System.Windows.Point]::new($x + $pw - $fold, $y), $true, $true)
+    $c.LineTo([System.Windows.Point]::new($x + $pw - $fold, $y + $fold), $true, $false)
+    $c.LineTo([System.Windows.Point]::new($x + $pw, $y + $fold), $true, $false)
+    $c.Close()
+    $f.Freeze()
+    $dc.DrawGeometry($bc.ConvertFromString('#DDE3EA'), $pen, $f)
+
+    $grey = $bc.ConvertFromString('#D5DBE2')
+    $dc.DrawRectangle($grey, $null, [System.Windows.Rect]::new($x + 24, $y + 78, 120, 9))
+    $dc.DrawRectangle($grey, $null, [System.Windows.Rect]::new($x + 24, $y + 98, 150, 9))
+    $dc.DrawRectangle($grey, $null, [System.Windows.Rect]::new($x + 24, $y + 118, 100, 9))
+
+    $by = $y + 160; $bh = 70
+    $dc.DrawRectangle($bc.ConvertFromString($hex), $null, [System.Windows.Rect]::new($x, $by, $pw, $bh))
+    try {
+        $fs = 46; if ($label.Length -ge 4) { $fs = 36 }
+        $ft = New-Object System.Windows.Media.FormattedText($label, [Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, (New-Object System.Windows.Media.Typeface('Segoe UI')), $fs, [System.Windows.Media.Brushes]::White)
+        $ft.SetFontWeight([System.Windows.FontWeights]::Bold)
+        $dc.DrawText($ft, [System.Windows.Point]::new($x + ($pw - $ft.Width) / 2, $by + ($bh - $ft.Height) / 2))
+    } catch { }
+    $dc.Close()
+    $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($S, $S, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($dv)
+    $rtb.Freeze()
+    return $rtb
+}
+
+function Get-DocIcon([string]$name) {
+    $ext = [IO.Path]::GetExtension($name).ToLowerInvariant()
+    if (-not $ext -or $script:docExts -notcontains $ext) { return $null }
+    $st = Get-DocStyle $ext
+    $key = $st[0] + $st[1]
+    if (-not $script:docIconCache.ContainsKey($key)) { $script:docIconCache[$key] = New-DocIconImage $st[0] $st[1] }
+    return $script:docIconCache[$key]
+}
+
+$script:origStartShell16 = ${function:Start-ShellThumbs}
+function Start-ShellThumbs($items, $includeJpg = $false, $force = $false, $px = 0) {
+    try {
+        foreach ($it in $items) {
+            if ($it.IsDir -or $it.IsJpg) { continue }
+            $ic = Get-DocIcon $it.Name
+            if ($ic) { $it.Thumb = $ic }
+        }
+    } catch { }
+    & $script:origStartShell16 $items $includeJpg $force $px
+}
+# ===== END SCRIPT16 =====
 $win.ShowDialog() | Out-Null
 
 
