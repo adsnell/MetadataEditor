@@ -2906,8 +2906,8 @@ function Update-WinTitle {
         if ($p) {
             $leaf = [IO.Path]::GetFileName($p.TrimEnd('\'))
             if (-not $leaf) { $leaf = $p }
-            $win.Title = "$leaf  -  MetadataEditor v2"
-        } else { $win.Title = 'MetadataEditor v2' }
+            $win.Title = "$leaf  -  MetadataEditor v2.1"
+        } else { $win.Title = 'MetadataEditor v2.1' }
     } catch { }
 }
 $txtPath.Add_TextChanged({ Update-WinTitle })
