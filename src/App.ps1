@@ -2906,8 +2906,8 @@ function Update-WinTitle {
         if ($p) {
             $leaf = [IO.Path]::GetFileName($p.TrimEnd('\'))
             if (-not $leaf) { $leaf = $p }
-            $win.Title = "$leaf  -  MetadataEditor v2.1"
-        } else { $win.Title = 'MetadataEditor v2.1' }
+            $win.Title = "$leaf  -  MetadataEditor v2.2"
+        } else { $win.Title = 'MetadataEditor v2.2' }
     } catch { }
 }
 $txtPath.Add_TextChanged({ Update-WinTitle })
@@ -3017,7 +3017,7 @@ $btnClearCache.Add_Click({ Clear-ThumbCache })
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nPOLISH`nThe Save button turns orange (and changed fields get an orange border) while you have unsaved edits. The status bar shows errors in red, hints in amber and completed actions in green. Column widths and pane sizes are remembered. In Thumbnails view, Clear cache deletes cached thumbnails (they rebuild by themselves; the cache is also trimmed automatically above 200 MB).`n`nPress F1 any time")
 # ===== END SCRIPT14 =====
 # ===== SCRIPT15-MARKER =====
-$script:appVersion = '2.1'
+$script:appVersion = '2.2'
 $script:donateUrl  = 'https://paypal.me/AndrewSnell791'
 
 function Get-AncestorOf($d, [type]$t) {
@@ -3373,6 +3373,14 @@ function Start-ShellThumbs($items, $includeJpg = $false, $force = $false, $px = 
     & $script:origStartShell16 $items $includeJpg $force $px
 }
 # ===== END SCRIPT16 =====
+# ===== SCRIPT-EPUB-MARKER =====
+$script:docExts = @($script:docExts) + '.epub'
+$script:origDocStyleEpub = ${function:Get-DocStyle}
+function Get-DocStyle([string]$ext) {
+    if ($ext -eq '.epub') { return @('EPUB', '#0097A7') }
+    return (& $script:origDocStyleEpub $ext)
+}
+# ===== END SCRIPT-EPUB =====
 $win.ShowDialog() | Out-Null
 
 
