@@ -2906,8 +2906,8 @@ function Update-WinTitle {
         if ($p) {
             $leaf = [IO.Path]::GetFileName($p.TrimEnd('\'))
             if (-not $leaf) { $leaf = $p }
-            $win.Title = "$leaf  -  MetadataEditor v2.2"
-        } else { $win.Title = 'MetadataEditor v2.2' }
+            $win.Title = "$leaf  -  MetadataEditor v3.0"
+        } else { $win.Title = 'MetadataEditor v3.0' }
     } catch { }
 }
 $txtPath.Add_TextChanged({ Update-WinTitle })
@@ -3017,7 +3017,7 @@ $btnClearCache.Add_Click({ Clear-ThumbCache })
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nPOLISH`nThe Save button turns orange (and changed fields get an orange border) while you have unsaved edits. The status bar shows errors in red, hints in amber and completed actions in green. Column widths and pane sizes are remembered. In Thumbnails view, Clear cache deletes cached thumbnails (they rebuild by themselves; the cache is also trimmed automatically above 200 MB).`n`nPress F1 any time")
 # ===== END SCRIPT14 =====
 # ===== SCRIPT15-MARKER =====
-$script:appVersion = '2.2'
+$script:appVersion = '3.0'
 $script:donateUrl  = 'https://paypal.me/AndrewSnell791'
 
 function Get-AncestorOf($d, [type]$t) {
@@ -3381,6 +3381,583 @@ function Get-DocStyle([string]$ext) {
     return (& $script:origDocStyleEpub $ext)
 }
 # ===== END SCRIPT-EPUB =====
+# ===== SCRIPT17-MARKER =====
+# ---------- Search upgrade: field terms, names only, recent searches, cancel + progress ----------
+$script:fieldTerms = @()
+$script:nameOnly = $false
+$script:metaObjs = @{}
+$script:metaFields = @{}
+$script:deepHasMeta = $false
+$script:deepIdx = $null
+$script:suppressFieldCache = $false
+$script:fieldKeys = @('Title', 'Headline', 'Creator', 'Subject', 'Description', 'Rights', 'Model', 'Rating')
+$script:fieldAlias = @{
+    title = 'Title'; subject = 'Headline'; headline = 'Headline'
+    author = 'Creator'; authors = 'Creator'; creator = 'Creator'
+    tag = 'Subject'; tags = 'Subject'; keyword = 'Subject'; keywords = 'Subject'
+    comment = 'Description'; comments = 'Description'; description = 'Description'
+    copyright = 'Rights'; rights = 'Rights'
+    camera = 'Model'; model = 'Model'
+    rating = 'Rating'; stars = 'Rating'
+    name = '_name'; file = '_name'; filename = '_name'
+    ext = '_ext'; type = '_ext'
+}
+
+try {
+if (-not ('DeepSearchIndex' -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+public class DeepSearchIndex {
+    private Dictionary<string, Dictionary<string, string>> map = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+    public void Add(string path, string[] keys, string[] vals) {
+        Dictionary<string, string> d = new Dictionary<string, string>();
+        for (int i = 0; i < keys.Length; i++) { d[keys[i]] = vals[i]; }
+        map[path] = d;
+    }
+
+    public string[] Run(string[] files, Dictionary<string, string> meta, string[] plain, bool nameOnly,
+                        string[] fKeys, string[] fOps, string[] fVals, int[] fNums, int max) {
+        List<string> res = new List<string>();
+        foreach (string f in files) {
+            string name = Path.GetFileName(f).ToLowerInvariant();
+            bool ok = true;
+            if (plain.Length > 0) {
+                string m = null;
+                if (!nameOnly && meta != null) { meta.TryGetValue(f, out m); }
+                foreach (string t in plain) {
+                    if (!(name.Contains(t) || (m != null && m.Contains(t)))) { ok = false; break; }
+                }
+            }
+            if (ok && fKeys.Length > 0) {
+                Dictionary<string, string> fm = null;
+                map.TryGetValue(f, out fm);
+                for (int i = 0; i < fKeys.Length && ok; i++) {
+                    string k = fKeys[i];
+                    if (k == "_name") { ok = name.Contains(fVals[i]); }
+                    else if (k == "_ext") { ok = (Path.GetExtension(name).TrimStart('.') == fVals[i]); }
+                    else if (k == "Rating") {
+                        int r = 0;
+                        string rs = null;
+                        if (fm != null && fm.TryGetValue("Rating", out rs)) { int.TryParse(rs, out r); }
+                        string op = fOps[i];
+                        int n = fNums[i];
+                        if (op == ">=") { ok = (r >= n); }
+                        else if (op == "<=") { ok = (r <= n); }
+                        else if (op == ">") { ok = (r > n); }
+                        else if (op == "<") { ok = (r < n); }
+                        else { ok = (r == n); }
+                    } else {
+                        string tx = null;
+                        ok = (fm != null && fm.TryGetValue(k, out tx) && tx != null && tx.Length > 0 && tx.Contains(fVals[i]));
+                    }
+                }
+            }
+            if (ok) { res.Add(f); if (res.Count >= max) { break; } }
+        }
+        return res.ToArray();
+    }
+}
+"@
+}
+} catch { Write-Log ('DeepSearchIndex: ' + $_.Exception.ToString()) }
+
+# ---------- Query parsing ----------
+function Parse-SearchQuery([string]$q) {
+    $plain = New-Object 'System.Collections.Generic.List[string]'
+    $fl = New-Object 'System.Collections.Generic.List[object]'
+    $q = ([string]$q).ToLowerInvariant()
+    foreach ($m in [regex]::Matches($q, '(?:([a-z]+):)?(?:"([^"]*)"|(\S+))')) {
+        $pre = $m.Groups[1].Value
+        if ($m.Groups[2].Success) { $val = $m.Groups[2].Value } else { $val = $m.Groups[3].Value.Trim('"') }
+        $val = $val.Trim()
+        if ($pre -and $script:fieldAlias.ContainsKey($pre)) {
+            if (-not $val) { continue }
+            $key = $script:fieldAlias[$pre]
+            if ($key -eq 'Rating') {
+                $op = '='
+                $num = $null
+                if ($val -match '^(>=|<=|>|<|=)?\s*(\d+)$') {
+                    if ($matches[1]) { $op = $matches[1] }
+                    $num = [int]$matches[2]
+                } elseif ($val -eq 'none' -or $val -eq 'unrated') { $num = 0 }
+                if ($null -eq $num) { continue }
+                $fl.Add(@{ Key = 'Rating'; Op = $op; Num = $num; Value = $val })
+            } else {
+                if ($key -eq '_ext') { $val = $val.TrimStart('.') }
+                if (-not $val) { continue }
+                $fl.Add(@{ Key = $key; Op = ''; Num = 0; Value = $val })
+            }
+        } else {
+            if ($pre) { $val = $m.Value.Trim().Trim('"') }
+            if (-not $val) { continue }
+            if ($val -match '^([a-z]+):$' -and $script:fieldAlias.ContainsKey($matches[1])) { continue }
+            $plain.Add($val)
+        }
+    }
+    return @{ Plain = $plain.ToArray(); Fields = $fl.ToArray() }
+}
+
+function Get-FieldMap($o) {
+    $m = @{}
+    foreach ($k in $script:fieldKeys) { $m[$k] = (Get-FieldText $o $k).ToLowerInvariant() }
+    return $m
+}
+
+function Get-CachedFields([string]$path) {
+    $m = $script:metaFields[$path]
+    if ($null -ne $m) { return $m }
+    $o = $script:metaObjs[$path]
+    if ($null -eq $o) { return $null }
+    $m = Get-FieldMap $o
+    $script:metaFields[$path] = $m
+    return $m
+}
+
+function Test-FieldTerm($ft, [string]$fileName, $ff) {
+    $k = $ft.Key
+    if ($k -eq '_name') { return $fileName.ToLowerInvariant().Contains($ft.Value) }
+    if ($k -eq '_ext') { return ([IO.Path]::GetExtension($fileName).TrimStart('.').ToLowerInvariant() -eq $ft.Value) }
+    if ($k -eq 'Rating') {
+        $r = 0
+        if ($ff) { [void][int]::TryParse([string]$ff['Rating'], [ref]$r) }
+        $n = [int]$ft.Num
+        switch ($ft.Op) {
+            '>=' { return ($r -ge $n) }
+            '<=' { return ($r -le $n) }
+            '>'  { return ($r -gt $n) }
+            '<'  { return ($r -lt $n) }
+            default { return ($r -eq $n) }
+        }
+    }
+    if (-not $ff) { return $false }
+    $t = [string]$ff[$k]
+    return ($t.Length -gt 0 -and $t.Contains($ft.Value))
+}
+
+function Test-SearchNeedsMeta {
+    foreach ($ft in @($script:fieldTerms)) { if ($ft.Key -ne '_name' -and $ft.Key -ne '_ext') { return $true } }
+    if (-not $script:nameOnly -and @($script:searchTerms).Count -gt 0) { return $true }
+    return $false
+}
+
+# keep the per-file field data fresh whenever the Details columns are (re)loaded or saved
+$script:prevSetItemCols17 = ${function:Set-ItemCols}
+function Set-ItemCols($it, $o) {
+    & $script:prevSetItemCols17 $it $o
+    try {
+        if (-not $script:suppressFieldCache) {
+            $script:metaObjs[$it.FullPath] = $o
+            $script:metaFields.Remove($it.FullPath)
+        }
+    } catch { }
+}
+
+# ---------- Current-folder index and filter ----------
+function Build-MetaIndex {
+    $script:metaText = @{}
+    $script:metaObjs = @{}
+    $script:metaFields = @{}
+    $byKey = @{}
+    $oitems = @()
+    foreach ($it in @($list.ItemsSource)) {
+        if ($it.IsDir) { continue }
+        $mode = Get-XmpMode $it
+        if (-not $mode) { continue }
+        if ($mode -eq 'office') { if (-not $it.IsCloud) { $oitems += $it }; continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $byKey[$tp.ToLowerInvariant()] = @{ Item = $it; Path = $tp } }
+    }
+    $all = @($byKey.Values | ForEach-Object { $_.Path })
+    for ($i = 0; $i -lt $all.Count; $i += 150) {
+        $chunk = @($all[$i..([Math]::Min($i + 149, $all.Count - 1))])
+        $cmd = @('-j', '-charset', 'filename=utf8')
+        foreach ($f in $fields) { $cmd += ('-' + $f.Tag) }
+        $cmd += '-Model'
+        $cmd += $chunk
+        $json = $script:et.Run([string[]]$cmd)
+        if (-not $json.Trim()) { continue }
+        $objs = @()
+        $objs += (ConvertFrom-Json $json)
+        foreach ($o in $objs) {
+            $key = (("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()
+            $entry = $byKey[$key]
+            if (-not $entry) { continue }
+            $script:metaText[$entry.Item.FullPath] = (Get-AllText $o)
+            $script:metaObjs[$entry.Item.FullPath] = $o
+        }
+    }
+    foreach ($it in $oitems) {
+        $o = Read-OfficeProps $it.FullPath
+        $script:metaText[$it.FullPath] = (Get-AllText $o)
+        $script:metaObjs[$it.FullPath] = $o
+    }
+    $script:metaReady = $true
+}
+
+$script:searchPredicate = [System.Predicate[object]]{
+    param($o)
+    $name = $o.Name.ToLowerInvariant()
+    if (@($script:searchTerms).Count -gt 0) {
+        $meta = $null
+        if (-not $script:nameOnly) { $meta = $script:metaText[$o.FullPath] }
+        foreach ($term in $script:searchTerms) {
+            if (-not ($name.Contains($term) -or ($meta -and $meta.Contains($term)))) { return $false }
+        }
+    }
+    if (@($script:fieldTerms).Count -gt 0) {
+        $ff = $null
+        foreach ($ft in $script:fieldTerms) {
+            if ($ft.Key -ne '_name' -and $ft.Key -ne '_ext' -and $null -eq $ff) { $ff = Get-CachedFields $o.FullPath }
+            if (-not (Test-FieldTerm $ft $o.Name $ff)) { return $false }
+        }
+    }
+    return $true
+}
+
+# ---------- Subfolder search: progress bar + Cancel ----------
+$s17Border = $txtStatus.Parent
+if ($s17Border -is [System.Windows.Controls.Border]) {
+    $s17Border.Child = $null
+    $s17Dock = New-Object System.Windows.Controls.DockPanel
+    $btnDeepCancel = New-Object System.Windows.Controls.Button
+    $btnDeepCancel.Content = 'Cancel search'
+    $btnDeepCancel.FontSize = 12
+    $btnDeepCancel.Height = 20
+    $btnDeepCancel.Padding = [System.Windows.Thickness]::new(10, 0, 10, 0)
+    $btnDeepCancel.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+    $btnDeepCancel.Visibility = 'Collapsed'
+    [System.Windows.Controls.DockPanel]::SetDock($btnDeepCancel, [System.Windows.Controls.Dock]::Right)
+    $script:deepProg = New-Object System.Windows.Controls.ProgressBar
+    $script:deepProg.IsIndeterminate = $true
+    $script:deepProg.Width = 150
+    $script:deepProg.Height = 12
+    $script:deepProg.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+    $script:deepProg.Visibility = 'Collapsed'
+    [System.Windows.Controls.DockPanel]::SetDock($script:deepProg, [System.Windows.Controls.Dock]::Right)
+    [void]$s17Dock.Children.Add($btnDeepCancel)
+    [void]$s17Dock.Children.Add($script:deepProg)
+    [void]$s17Dock.Children.Add($txtStatus)
+    $s17Border.Child = $s17Dock
+}
+function Show-DeepProgress { try { $script:deepProg.Visibility = 'Visible'; $btnDeepCancel.Visibility = 'Visible' } catch { } }
+function Hide-DeepProgress { try { $script:deepProg.Visibility = 'Collapsed'; $btnDeepCancel.Visibility = 'Collapsed' } catch { } }
+
+function Stop-Deep {
+    $deepTimer.Stop()
+    Hide-DeepProgress
+    if ($script:deepReady) { return }
+    if ($script:deepWalker) { $script:deepWalker.Stop() }
+    if ($script:deepExif) { $script:deepExif.Kill() }
+    $script:deepWalker = $null
+    $script:deepExif = $null
+}
+
+function Import-DeepMeta($w, $json) {
+    if (-not $json -or -not $json.Trim()) { return }
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = [int]::MaxValue
+    $objs = $js.DeserializeObject($json)
+    $keys = [string[]]$script:fieldKeys
+    foreach ($o in $objs) {
+        $sf = ([string]$o['SourceFile']) -replace '/', '\'
+        $m = Get-FieldMap $o
+        $vals = New-Object 'string[]' $keys.Length
+        for ($i = 0; $i -lt $keys.Length; $i++) { $vals[$i] = [string]$m[$keys[$i]] }
+        if ($script:deepIdx) { $script:deepIdx.Add($sf, $keys, $vals) }
+        $txt = ($vals -join ' ').Trim()
+        if ($txt) { $w.Meta[$sf] = $txt }
+        $script:deepFields[$sf.ToLowerInvariant()] = $o
+    }
+}
+
+function Show-DeepResults {
+    $w = $script:deepWalker
+    if (-not $w -or (@($script:searchTerms).Count -eq 0 -and @($script:fieldTerms).Count -eq 0)) { return }
+    $terms = [string[]]@($script:searchTerms)
+    if ($script:deepIdx) {
+        $fts = @($script:fieldTerms)
+        $fKeys = [string[]]@($fts | ForEach-Object { $_.Key })
+        $fOps = [string[]]@($fts | ForEach-Object { $_.Op })
+        $fVals = [string[]]@($fts | ForEach-Object { $_.Value })
+        $fNums = [int[]]@($fts | ForEach-Object { [int]$_.Num })
+        $files = [string[]]([DeepWalker2].GetField('files', [System.Reflection.BindingFlags]'Instance,NonPublic').GetValue($w))
+        $paths = @($script:deepIdx.Run($files, $w.Meta, $terms, [bool]$script:nameOnly, $fKeys, $fOps, $fVals, $fNums, 2000))
+    } else {
+        $paths = @($w.Filter($terms, 2000))
+    }
+    $items = New-Object 'System.Collections.Generic.List[FileItem]'
+    $script:suppressFieldCache = $true
+    try {
+        foreach ($pth in $paths) {
+            $i = New-ItemFromPath $pth $script:deepRoot
+            if ($i) {
+                $o = $script:deepFields[$pth.ToLowerInvariant()]
+                if ($o) { Set-ItemCols $i $o }
+                $items.Add($i)
+            }
+        }
+    } finally { $script:suppressFieldCache = $false }
+    $script:deepActive = $true
+    $list.ItemsSource = $items
+    Set-FolderCol $true
+    Apply-Sort
+    Start-ShellThumbs $items $true
+    $more = ''
+    if ($paths.Count -ge 2000) { $more = ' (first 2000 shown)' }
+    $txtStatus.Text = "$($items.Count) match(es) in subfolders$more for '$($txtSearch.Text.Trim())'   |   $($w.FileCount) files searched"
+}
+
+function Start-Deep {
+    $sroot = $txtPath.Text
+    if (-not $sroot -or -not [IO.Directory]::Exists($sroot)) { return }
+    if ([IO.Path]::GetPathRoot($sroot).TrimEnd('\') -ieq $sroot.TrimEnd('\')) {
+        $txtStatus.Text = 'Subfolder search needs a folder, not a whole drive.'
+        return
+    }
+    $script:deepRoot = $sroot
+    $script:deepReady = $false
+    $script:deepHasMeta = $false
+    $script:deepExifStarted = $false
+    $script:deepExif = $null
+    $script:deepFields = @{}
+    try { $script:deepIdx = New-Object DeepSearchIndex } catch { $script:deepIdx = $null }
+    $w = New-Object DeepWalker2
+    $script:deepWalker = $w
+    $w.Start($sroot, 100000, [string[]]$script:xmpEmbedded)
+    $txtStatus.Text = 'Searching subfolders...'
+    Show-DeepProgress
+    $deepTimer.Start()
+}
+
+$deepTimer = New-Object System.Windows.Threading.DispatcherTimer
+$deepTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+$deepTimer.Add_Tick({
+    try {
+        $w = $script:deepWalker
+        if (-not $w) { $deepTimer.Stop(); Hide-DeepProgress; return }
+        if (-not $w.Done) { $txtStatus.Text = "Searching subfolders... $($w.Count) files scanned"; return }
+        if (-not $script:deepExifStarted) {
+            $script:deepExifStarted = $true
+            $rd = @($w.Readable)
+            if ($rd.Count -eq 0) { $script:deepHasMeta = $true }
+            elseif (Test-SearchNeedsMeta) {
+                $lines = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+                foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+                $lines.Add('-Model')
+                foreach ($r in $rd) { $lines.Add($r) }
+                $argFile = Join-Path $root 'cache\_deep_args.txt'
+                [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+                $x0 = New-Object AsyncExif
+                $script:deepExif = $x0
+                $x0.Start($cfg.ExifToolPath, $argFile)
+                return
+            }
+        }
+        $x = $script:deepExif
+        if ($x -and -not $x.Done) { $txtStatus.Text = "Reading XMP from $(@($w.Readable).Count) files..."; return }
+        $deepTimer.Stop()
+        Hide-DeepProgress
+        if ($x) { Import-DeepMeta $w $x.Output; $script:deepHasMeta = $true }
+        $script:deepReady = $true
+        $script:metaReady = $true
+        Show-DeepResults
+    } catch {
+        $deepTimer.Stop()
+        Hide-DeepProgress
+        $txtStatus.Text = 'Subfolder search error: ' + $_.Exception.Message
+        Write-Log $_.Exception.ToString()
+    }
+})
+
+$btnDeepCancel.Add_Click({
+    try {
+        $deepTimer.Stop()
+        if ($script:deepWalker) { $script:deepWalker.Stop() }
+        if ($script:deepExif) { $script:deepExif.Kill() }
+        $script:deepWalker = $null
+        $script:deepExif = $null
+        $script:deepReady = $false
+        $script:deepHasMeta = $false
+        Hide-DeepProgress
+        $chkSub.IsChecked = $false
+        Apply-Search
+        $txtStatus.Text = 'Subfolder search cancelled   |   ' + $txtStatus.Text
+    } catch { Write-Log $_.Exception.ToString() }
+})
+
+# ---------- Apply / reset ----------
+function Apply-Search {
+    $raw = $txtSearch.Text.Trim()
+    $pq = Parse-SearchQuery $raw
+    $script:searchTerms = $pq.Plain
+    $script:fieldTerms = $pq.Fields
+    if ($script:searchTerms.Count -eq 0 -and $script:fieldTerms.Count -eq 0) {
+        Stop-Deep
+        Restore-Folder
+        $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+        if ($v) { $v.Filter = $null; $v.Refresh() }
+        if ($script:folderStatus) { $txtStatus.Text = $script:folderStatus }
+        return
+    }
+    $needMeta = Test-SearchNeedsMeta
+
+    if ($chkSub.IsChecked) {
+        if (-not $script:metaReady -and $script:deepReady) {
+            $script:deepReady = $false; $script:deepWalker = $null; $script:deepExif = $null
+        }
+        if ($script:deepReady -and $needMeta -and -not $script:deepHasMeta) {
+            $script:deepReady = $false; $script:deepWalker = $null; $script:deepExif = $null
+        }
+        if ($script:deepReady) { Show-DeepResults; return }
+        if ($script:deepWalker) { $deepTimer.Start(); return }
+        Start-Deep
+        return
+    }
+
+    Stop-Deep
+    Restore-Folder
+    $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+    if (-not $v) { return }
+    if ($needMeta -and -not $script:metaReady) {
+        $txtStatus.Text = 'Indexing XMP metadata...'
+        $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+        Build-MetaIndex
+    }
+    $v.Filter = $script:searchPredicate
+    $v.Refresh()
+    $cnt = 0
+    foreach ($x in $v) { $cnt++ }
+    $txtStatus.Text = "$cnt match(es) for '$raw'   |   $($script:folderStatus)"
+}
+
+function Reset-Search {
+    $script:metaReady = $false
+    $script:metaText = @{}
+    $script:metaObjs = @{}
+    $script:metaFields = @{}
+    $script:searchTerms = @()
+    $script:fieldTerms = @()
+    $script:deepReady = $false
+    $script:deepHasMeta = $false
+    Stop-Deep
+    $script:deepWalker = $null
+    $script:deepExif = $null
+    $script:deepActive = $false
+    Set-FolderCol $false
+    if ($txtSearch.Text) { $txtSearch.Text = '' }
+}
+
+# ---------- Names only toggle, recent searches, wider search box ----------
+$txtSearch.Width = 230
+$txtSearch.ToolTip = "Search file names and XMP. All words must match.`nField search: tag:holiday  title:paris  author:name  comment:text  copyright:text  camera:model  rating:4  rating:>=3  ext:jpg  name:text`nUse quotes for phrases. Esc clears."
+
+$chkName = New-Object System.Windows.Controls.CheckBox
+$chkName.Content = 'Names only'
+$chkName.FontSize = 12
+$chkName.VerticalAlignment = 'Center'
+$chkName.Margin = [System.Windows.Thickness]::new(0, 0, 12, 0)
+$chkName.ToolTip = "Plain words match file names only (XMP is ignored).`nfield:value terms such as tag:holiday still work."
+[System.Windows.Controls.DockPanel]::SetDock($chkName, [System.Windows.Controls.Dock]::Right)
+$txtSearch.Parent.Children.Add($chkName) | Out-Null
+$chkName.Add_Click({
+    $script:nameOnly = [bool]$chkName.IsChecked
+    $searchTimer.Stop()
+    Apply-Search
+})
+
+$script:recentSearches = @()
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st17 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st17 -and $st17.RecentSearches) { $script:recentSearches = @($st17.RecentSearches | ForEach-Object { [string]$_ } | Select-Object -First 10) }
+    }
+} catch { }
+
+function Add-RecentSearch([string]$q) {
+    $q = ([string]$q).Trim()
+    if ($q.Length -lt 2) { return }
+    $cur = @($script:recentSearches)
+    if ($cur.Count -gt 0 -and $cur[0] -ieq $q) { return }
+    $acc = New-Object 'System.Collections.Generic.List[string]'
+    $acc.Add($q)
+    foreach ($r in $cur) { if ($r -and $r -ine $q -and $acc.Count -lt 10) { $acc.Add($r) } }
+    $script:recentSearches = $acc.ToArray()
+    Set-Setting 'RecentSearches' ([string[]]$script:recentSearches)
+}
+function Clear-RecentSearches {
+    $script:recentSearches = @()
+    Set-Setting 'RecentSearches' ([string[]]@())
+}
+function Use-RecentSearch([string]$q) {
+    if (-not $q) { return }
+    Add-RecentSearch $q
+    if ($txtSearch.Text -eq $q) { $searchTimer.Stop(); Apply-Search } else { $txtSearch.Text = $q }
+    $txtSearch.Focus() | Out-Null
+    $txtSearch.CaretIndex = $txtSearch.Text.Length
+}
+function Show-RecentSearches {
+    $cm = New-Object System.Windows.Controls.ContextMenu
+    $recent = @($script:recentSearches)
+    if ($recent.Count -eq 0) {
+        $mi0 = New-Object System.Windows.Controls.MenuItem
+        $mi0.Header = '(no recent searches yet)'
+        $mi0.IsEnabled = $false
+        [void]$cm.Items.Add($mi0)
+    } else {
+        foreach ($r in $recent) {
+            $mi = New-Object System.Windows.Controls.MenuItem
+            $tbk = New-Object System.Windows.Controls.TextBlock
+            $tbk.Text = [string]$r
+            $mi.Header = $tbk
+            $mi.Tag = [string]$r
+            $mi.Add_Click({ param($s, $e) Use-RecentSearch ([string]$s.Tag) })
+            [void]$cm.Items.Add($mi)
+        }
+        [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
+        $mc = New-Object System.Windows.Controls.MenuItem
+        $mc.Header = 'Clear recent searches'
+        $mc.Add_Click({ Clear-RecentSearches })
+        [void]$cm.Items.Add($mc)
+    }
+    $cm.PlacementTarget = $btnRecent
+    $cm.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $cm.IsOpen = $true
+}
+
+$btnRecent = New-Object System.Windows.Controls.Button
+try { $btnRecent.Style = $win.FindResource('TB') } catch { }
+$btnRecent.Content = [string][char]0x25BE
+$btnRecent.Width = 22
+$btnRecent.Height = 26
+$btnRecent.Margin = [System.Windows.Thickness]::new(2, 0, 0, 0)
+$btnRecent.Focusable = $false
+$btnRecent.ToolTip = 'Recent searches'
+[System.Windows.Controls.DockPanel]::SetDock($btnRecent, [System.Windows.Controls.Dock]::Right)
+$s17Bar = $txtSearch.Parent
+$s17Bar.Children.Insert($s17Bar.Children.IndexOf($txtSearch), $btnRecent)
+$btnRecent.Add_Click({ Show-RecentSearches })
+
+$txtSearch.AddHandler([System.Windows.UIElement]::PreviewKeyDownEvent, [System.Windows.Input.KeyEventHandler]{
+    param($s, $e)
+    if ($e.Key -eq 'Return') { Add-RecentSearch $txtSearch.Text }
+}, $true)
+$txtSearch.Add_LostKeyboardFocus({ Add-RecentSearch $txtSearch.Text })
+
+$s17Help = @(
+'SEARCHING',
+'Type words to match file names and XMP metadata; every word must match. To search one field only, use field:value, for example tag:holiday, title:paris, author:andrew, comment:wedding, copyright:snell, subject:harbour, camera:x-e5, rating:4, rating:>=3, ext:jpg or name:img. Put quotes round a phrase: tag:"new york". Field terms match part of a word, so tag:holiday also finds holidays. Tag: is the Tags box; subject: is the Subject box.',
+'Tick Names only to match plain words against file names only; field:value terms still work. It also makes subfolder searches much faster because XMP is not read.',
+'Tick Subfolders to search below this folder. The bar at the bottom shows progress and Cancel search stops it. The arrow beside the search box lists your recent searches.'
+) -join "`n"
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`n" + $s17Help + "`n`nPress F1 any time")
+# ===== END SCRIPT17 =====
+
 $win.ShowDialog() | Out-Null
 
 
