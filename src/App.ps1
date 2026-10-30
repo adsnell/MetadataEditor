@@ -40,6 +40,10 @@ public class FileItem : INotifyPropertyChanged {
     public string RatingText { get { return _ratingText; } set { _ratingText = value; Notify("RatingText"); } }
     private string _cameraText;
     public string CameraText { get { return _cameraText; } set { _cameraText = value; Notify("CameraText"); } }
+    private string _commentText;
+    public string CommentText { get { return _commentText; } set { _commentText = value; Notify("CommentText"); } }
+    private string _takenText;
+    public string TakenText { get { return _takenText; } set { _takenText = value; Notify("TakenText"); } }
     private string _copyrightText;
     public string CopyrightText { get { return _copyrightText; } set { _copyrightText = value; Notify("CopyrightText"); } }
     private void Notify(string n) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(n)); }
@@ -3958,6 +3962,500 @@ $s17Help = @(
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`n" + $s17Help + "`n`nPress F1 any time")
 # ===== END SCRIPT17 =====
 
+# ===== SCRIPT18-MARKER =====
+# ---------- Negated search terms: -tag:holiday  -rating:>=3  -word ----------
+$script:negPlain = @()
+$script:negFields = @()
+
+function Parse-SearchQuery([string]$q) {
+    $plain = New-Object 'System.Collections.Generic.List[string]'
+    $fl = New-Object 'System.Collections.Generic.List[object]'
+    $np = New-Object 'System.Collections.Generic.List[string]'
+    $nf = New-Object 'System.Collections.Generic.List[object]'
+    $q = ([string]$q).ToLowerInvariant()
+    foreach ($m in [regex]::Matches($q, '(-(?=[a-z"]))?(?:([a-z]+):)?(?:"([^"]*)"|(\S+))')) {
+        $neg = $m.Groups[1].Success
+        $pre = $m.Groups[2].Value
+        if ($m.Groups[3].Success) { $val = $m.Groups[3].Value } else { $val = $m.Groups[4].Value.Trim('"') }
+        $val = $val.Trim()
+        if ($pre -and $script:fieldAlias.ContainsKey($pre)) {
+            if (-not $val) { continue }
+            $key = $script:fieldAlias[$pre]
+            if ($key -eq 'Rating') {
+                $op = '='
+                $num = $null
+                if ($val -match '^(>=|<=|>|<|=)?\s*(\d+)$') {
+                    if ($matches[1]) { $op = $matches[1] }
+                    $num = [int]$matches[2]
+                } elseif ($val -eq 'none' -or $val -eq 'unrated') { $num = 0 }
+                if ($null -eq $num) { continue }
+                $ft = @{ Key = 'Rating'; Op = $op; Num = $num; Value = $val }
+            } else {
+                if ($key -eq '_ext') { $val = $val.TrimStart('.') }
+                if (-not $val) { continue }
+                $ft = @{ Key = $key; Op = ''; Num = 0; Value = $val }
+            }
+            if ($neg) { $nf.Add($ft) } else { $fl.Add($ft) }
+        } else {
+            if ($pre) { $val = $m.Value.TrimStart('-').Trim().Trim('"') }
+            if (-not $val) { continue }
+            if ($val -match '^([a-z]+):$' -and $script:fieldAlias.ContainsKey($matches[1])) { continue }
+            if ($neg) { $np.Add($val) } else { $plain.Add($val) }
+        }
+    }
+    # a query of only negatives starts from "everything"
+    if ($plain.Count -eq 0 -and $fl.Count -eq 0 -and ($np.Count + $nf.Count) -gt 0) {
+        $fl.Add(@{ Key = '_name'; Op = ''; Num = 0; Value = '' })
+    }
+    $script:negPlain = $np.ToArray()
+    $script:negFields = $nf.ToArray()
+    return @{ Plain = $plain.ToArray(); Fields = $fl.ToArray() }
+}
+
+function Test-Excluded([string]$fileName, $ff, [string]$metaText) {
+    $nm = $fileName.ToLowerInvariant()
+    foreach ($t in @($script:negPlain)) {
+        if (-not $t) { continue }
+        if ($nm.Contains($t)) { return $true }
+        if ((-not $script:nameOnly) -and $metaText -and $metaText.Contains($t)) { return $true }
+    }
+    foreach ($ft in @($script:negFields)) {
+        if ($ft -and (Test-FieldTerm $ft $fileName $ff)) { return $true }
+    }
+    return $false
+}
+
+function Test-SearchNeedsMeta {
+    foreach ($ft in (@($script:fieldTerms) + @($script:negFields))) {
+        if ($ft -and $ft.Key -ne '_name' -and $ft.Key -ne '_ext') { return $true }
+    }
+    if (-not $script:nameOnly -and (@($script:searchTerms).Count -gt 0 -or @($script:negPlain).Count -gt 0)) { return $true }
+    return $false
+}
+
+$script:prevPredicate18 = $script:searchPredicate
+$script:searchPredicate = [System.Predicate[object]]{
+    param($o)
+    if (-not $script:prevPredicate18.Invoke($o)) { return $false }
+    if (@($script:negPlain).Count -eq 0 -and @($script:negFields).Count -eq 0) { return $true }
+    if ($o.IsDir) { return $true }
+    $ff = $null
+    if (@($script:negFields).Count -gt 0) { $ff = Get-CachedFields $o.FullPath }
+    $mt = $script:metaText[$o.FullPath]
+    if (Test-Excluded $o.Name $ff $mt) { return $false }
+    return $true
+}
+
+function Show-DeepResults {
+    $w = $script:deepWalker
+    if (-not $w -or (@($script:searchTerms).Count -eq 0 -and @($script:fieldTerms).Count -eq 0)) { return }
+    $terms = [string[]]@($script:searchTerms)
+    if ($script:deepIdx) {
+        $fts = @($script:fieldTerms)
+        $fKeys = [string[]]@($fts | ForEach-Object { $_.Key })
+        $fOps = [string[]]@($fts | ForEach-Object { $_.Op })
+        $fVals = [string[]]@($fts | ForEach-Object { $_.Value })
+        $fNums = [int[]]@($fts | ForEach-Object { [int]$_.Num })
+        $files = [string[]]([DeepWalker2].GetField('files', [System.Reflection.BindingFlags]'Instance,NonPublic').GetValue($w))
+        $paths = @($script:deepIdx.Run($files, $w.Meta, $terms, [bool]$script:nameOnly, $fKeys, $fOps, $fVals, $fNums, 2000))
+    } else {
+        $paths = @($w.Filter($terms, 2000))
+    }
+    if (@($script:negPlain).Count -gt 0 -or @($script:negFields).Count -gt 0) {
+        $paths = @($paths | Where-Object {
+            $ff = $null
+            $o2 = $script:deepFields[([string]$_).ToLowerInvariant()]
+            if ($o2) { $ff = Get-FieldMap $o2 }
+            $mt = $null
+            try { $mt = $w.Meta[[string]$_] } catch { }
+            -not (Test-Excluded ([IO.Path]::GetFileName([string]$_)) $ff $mt)
+        })
+    }
+    $items = New-Object 'System.Collections.Generic.List[FileItem]'
+    $script:suppressFieldCache = $true
+    try {
+        foreach ($pth in $paths) {
+            $i = New-ItemFromPath $pth $script:deepRoot
+            if ($i) {
+                $o = $script:deepFields[$pth.ToLowerInvariant()]
+                if ($o) { Set-ItemCols $i $o }
+                $items.Add($i)
+            }
+        }
+    } finally { $script:suppressFieldCache = $false }
+    $script:deepActive = $true
+    $list.ItemsSource = $items
+    Set-FolderCol $true
+    Apply-Sort
+    Start-ShellThumbs $items $true
+    $more = ''
+    if ($paths.Count -ge 2000) { $more = ' (first 2000 shown)' }
+    $txtStatus.Text = "$($items.Count) match(es) in subfolders$more for '$($txtSearch.Text.Trim())'   |   $($w.FileCount) files searched"
+}
+
+$txtSearch.ToolTip = "Search file names and XMP. All words must match.`nField search: tag:holiday  title:paris  author:name  comment:text  copyright:text  camera:model  rating:4  rating:>=3  ext:jpg  name:text`nPut - in front to exclude: -tag:holiday  -rating:>=3  -draft`nUse quotes for phrases. Esc clears."
+
+# ---------- Recent-searches arrow: make it visible ----------
+try {
+    $btnRecent.Padding = [System.Windows.Thickness]::new(0)
+    $btnRecent.Width = 24
+    $btnRecent.FontSize = 15
+    $btnRecent.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Symbol')
+    $btnRecent.Foreground = [System.Windows.Media.Brushes]::Black
+    $btnRecent.Background = (New-Object System.Windows.Media.BrushConverter).ConvertFromString('#E3EAF3')
+} catch { Write-Log ('btnRecent: ' + $_.Exception.Message) }
+
+# ---------- Comments + Taken columns ----------
+$script:prevSetItemCols18 = ${function:Set-ItemCols}
+function Set-ItemCols($it, $o) {
+    & $script:prevSetItemCols18 $it $o
+    try {
+        $it.CommentText = ((Get-FieldText $o 'Description') -replace '\s+', ' ').Trim()
+        $tk = Get-FieldText $o 'DateTimeOriginal'
+        if ($tk.Length -ge 16) { $it.TakenText = ($tk.Substring(0, 10) -replace ':', '-') + ' ' + $tk.Substring(11, 5) }
+        elseif (-not $it.TakenText) { $it.TakenText = '' }
+    } catch { }
+}
+
+function Start-ColMeta($items) {
+    Stop-ColMeta
+    $map = @{}
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($a in '-j', '-charset', 'filename=utf8') { $lines.Add($a) }
+    foreach ($f in $fields) { $lines.Add('-' + $f.Tag) }
+    $lines.Add('-Model')
+    $lines.Add('-DateTimeOriginal')
+    foreach ($it in $items) {
+        if ($it.IsDir -or $it.IsCloud) { continue }
+        $mode = Get-XmpMode $it
+        if (-not $mode) { continue }
+        if ($mode -eq 'office') { $script:offQueue.Enqueue($it); continue }
+        $tp = Get-MetaTarget $it
+        if ([IO.File]::Exists($tp)) { $map[$tp.ToLowerInvariant()] = $it; $lines.Add($tp) }
+    }
+    if ($script:offQueue.Count -gt 0) { $offTimer.Start() }
+    if ($map.Count -eq 0) { return }
+    $argFile = Join-Path $root 'cache\_cols_args.txt'
+    [IO.File]::WriteAllLines($argFile, $lines, (New-Object Text.UTF8Encoding($false)))
+    $script:colMap = $map
+    $x = New-Object AsyncExif
+    $script:colExif = $x
+    $x.Start($cfg.ExifToolPath, $argFile)
+    $colTimer.Start()
+}
+
+$list.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $h = $e.OriginalSource
+    if ($h -is [System.Windows.Controls.GridViewColumnHeader] -and $h.Role -ne 'Padding') {
+        $map18 = @{ 'Comments' = 'CommentText'; 'Taken' = 'TakenText' }
+        $prop = $map18["$($h.Content)"]
+        if ($prop) {
+            if ($script:sortProp -eq $prop -and $script:sortDir -eq 'Ascending') { $script:sortDir = 'Descending' }
+            else { $script:sortProp = $prop; $script:sortDir = 'Ascending' }
+            Apply-Sort
+        }
+    }
+})
+
+# ---------- Undo save (restores the _original backup; needs KeepBackups) ----------
+function Do-UndoSave {
+    if (-not $cfg.KeepBackups) { $txtStatus.Text = 'Select files... Undo needs KeepBackups set to true in config.json (backups end in _original).'; return }
+    $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir })
+    if ($sel.Count -eq 0) { $txtStatus.Text = 'Select the files to undo first.'; return }
+    $pairs = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($it in $sel) {
+        $tp = Get-MetaTarget $it
+        $bk = $tp + '_original'
+        if ([IO.File]::Exists($bk)) { $pairs.Add(@{ Target = $tp; Backup = $bk }) }
+    }
+    if ($pairs.Count -eq 0) { $txtStatus.Text = 'No metadata backups (_original) found for the selected files.'; return }
+    if ((Msg "Restore $($pairs.Count) file(s) from their _original backups?`nThis replaces the current files." 'YesNo' 'Question') -ne 'Yes') { return }
+    Stop-Thumbs
+    Stop-ColMeta
+    $done = 0; $errs = @()
+    foreach ($p in $pairs) {
+        try { Move-Item -LiteralPath $p.Backup -Destination $p.Target -Force -ErrorAction Stop; $done++ }
+        catch { $errs += ([IO.Path]::GetFileName($p.Target) + ': ' + $_.Exception.Message) }
+    }
+    $script:metaReady = $false
+    if ($script:deepActive) { Apply-Search } else { Refresh-All }
+    $txtStatus.Text = "Restored $done file(s) from backup"
+    if ($errs.Count -gt 0) { [void](Msg ("Some files could not be restored:`n`n" + ($errs -join "`n")) 'OK' 'Warning') }
+}
+
+# ---------- Batch rename from metadata ----------
+function Get-RenameData($sel) {
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $sel) {
+        $paths.Add($it.FullPath)
+        $mt = Get-MetaTarget $it
+        if ($mt -ne $it.FullPath -and [IO.File]::Exists($mt)) { $paths.Add($mt) }
+    }
+    $all = @($paths | Select-Object -Unique)
+    $res = @{}
+    for ($i = 0; $i -lt $all.Count; $i += 100) {
+        $chunk = @($all[$i..([Math]::Min($i + 99, $all.Count - 1))])
+        $cmd = @('-j', '-charset', 'filename=utf8', '-m', '-DateTimeOriginal', '-CreateDate', '-Title', '-Headline', '-Creator', '-Model', '-Rating')
+        $cmd += $chunk
+        try {
+            $json = $script:et.Run([string[]]$cmd)
+            if (-not $json.Trim()) { continue }
+            $objs = @()
+            $objs += (ConvertFrom-Json $json)
+            foreach ($o in $objs) { $res[(("$($o.SourceFile)") -replace '/', '\').ToLowerInvariant()] = $o }
+        } catch { Write-Log ('Get-RenameData: ' + $_.Exception.Message) }
+    }
+    return $res
+}
+
+function Get-RenameInfo($it) {
+    $fo = $script:brData[$it.FullPath.ToLowerInvariant()]
+    $mo = $script:brData[(Get-MetaTarget $it).ToLowerInvariant()]
+    if (-not $mo) { $mo = $fo }
+    $dt = $null
+    foreach ($src in @($fo, $mo)) {
+        if (-not $src -or $dt) { continue }
+        foreach ($tg in 'DateTimeOriginal', 'CreateDate') {
+            if ($dt) { break }
+            $v = Get-FieldText $src $tg
+            $mm = [regex]::Match($v, '^(\d{4}):(\d\d):(\d\d)[ T](\d\d):(\d\d):(\d\d)')
+            if ($mm.Success) {
+                try { $dt = [datetime]::new([int]$mm.Groups[1].Value, [int]$mm.Groups[2].Value, [int]$mm.Groups[3].Value, [int]$mm.Groups[4].Value, [int]$mm.Groups[5].Value, [int]$mm.Groups[6].Value) } catch { $dt = $null }
+            }
+        }
+    }
+    if (-not $dt) { try { $dt = [IO.File]::GetLastWriteTime($it.FullPath) } catch { $dt = Get-Date } }
+    $r = @{}
+    $r['date'] = $dt.ToString('yyyyMMdd')
+    $r['time'] = $dt.ToString('HHmmss')
+    $r['title'] = Get-FieldText $mo 'Title'
+    $r['subject'] = Get-FieldText $mo 'Headline'
+    $r['author'] = Get-FieldText $mo 'Creator'
+    $r['camera'] = Get-FieldText $mo 'Model'
+    $r['rating'] = Get-FieldText $mo 'Rating'
+    $r['name'] = [IO.Path]::GetFileNameWithoutExtension($it.Name)
+    return $r
+}
+
+function New-RenamePlan([string]$pattern) {
+    $plan = New-Object 'System.Collections.Generic.List[object]'
+    $taken = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $bad = [IO.Path]::GetInvalidFileNameChars()
+    $trimChars = [char[]]' ._-'
+    $n = 0
+    foreach ($it in $script:brSel) {
+        $n++
+        $e = @{ Item = $it; Old = $it.Name; New = $it.Name; Skip = '' }
+        if ([string]::IsNullOrWhiteSpace($pattern)) { $e.Skip = 'empty pattern'; $plan.Add($e); continue }
+        $v = Get-RenameInfo $it
+        $v['n'] = $n.ToString('000')
+        $s = $pattern
+        foreach ($k in @($v.Keys)) {
+            $s = [regex]::Replace($s, [regex]::Escape('{' + $k + '}'), ([string]$v[$k]).Replace('$', '$$'), 'IgnoreCase')
+        }
+        $s = (($s.ToCharArray() | Where-Object { $bad -notcontains $_ }) -join '')
+        $s = ($s -replace '\s+', ' ' -replace '_{2,}', '_').Trim($trimChars)
+        if ($s.Length -gt 150) { $s = $s.Substring(0, 150).Trim($trimChars) }
+        if (-not $s) { $e.Skip = 'nothing left after filling the pattern'; $plan.Add($e); continue }
+        $ext = [IO.Path]::GetExtension($it.Name)
+        $dir = [IO.Path]::GetDirectoryName($it.FullPath)
+        $mode = Get-XmpMode $it
+        $cand = $s + $ext
+        $i = 2
+        while ($true) {
+            $cf = Join-Path $dir $cand
+            if ($cf -ieq $it.FullPath) { break }
+            $occ = ($taken.Contains($cf) -or [IO.File]::Exists($cf) -or [IO.Directory]::Exists($cf))
+            if (-not $occ -and $mode -eq 'sidecar') { $occ = [IO.File]::Exists([IO.Path]::ChangeExtension($cf, 'xmp')) }
+            if (-not $occ) { break }
+            $cand = $s + '_' + $i + $ext
+            $i++
+            if ($i -gt 999) { break }
+        }
+        [void]$taken.Add((Join-Path $dir $cand))
+        $e.New = $cand
+        $plan.Add($e)
+    }
+    return $plan.ToArray()
+}
+
+function Update-RenamePreview {
+    $plan = @(New-RenamePlan $script:brTb.Text)
+    $script:brPlan = $plan
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $skip = 0; $chg = 0
+    foreach ($p in $plan) {
+        if ($p.Skip) { $skip++; $t = $p.Old + '   ->   (skipped: ' + $p.Skip + ')' }
+        elseif ($p.New -ceq $p.Old) { $t = $p.Old + '   (no change)' }
+        else { $chg++; $t = $p.Old + '   ->   ' + $p.New }
+        if ($lines.Count -lt 400) { $lines.Add($t) }
+    }
+    $script:brLb.ItemsSource = $lines
+    $script:brSum.Text = "$chg to rename, $skip skipped, $($plan.Count - $chg - $skip) unchanged"
+    $script:brOk.IsEnabled = ($chg -gt 0)
+}
+
+function Do-BatchRename {
+    $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir })
+    if ($sel.Count -eq 0) { $txtStatus.Text = 'Select the files to rename first.'; return }
+    $txtStatus.Text = "Reading metadata for $($sel.Count) file(s)..."
+    try { $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render) } catch { }
+    $script:brSel = $sel
+    $script:brData = Get-RenameData $sel
+    $pat = '{date}_{title}'
+    try {
+        if ([IO.File]::Exists($settingsFile)) {
+            $st18 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+            if ($st18 -and $st18.RenamePattern) { $pat = [string]$st18.RenamePattern }
+        }
+    } catch { }
+
+    $w = New-Object System.Windows.Window
+    $w.Title = 'Batch rename from metadata'
+    $w.Width = 720; $w.Height = 560
+    $w.Owner = $win
+    $w.WindowStartupLocation = 'CenterOwner'
+    $dock = New-Object System.Windows.Controls.DockPanel
+    $dock.Margin = [System.Windows.Thickness]::new(12)
+    $top = New-Object System.Windows.Controls.StackPanel
+    [System.Windows.Controls.DockPanel]::SetDock($top, [System.Windows.Controls.Dock]::Top)
+    $l1 = New-Object System.Windows.Controls.TextBlock
+    $l1.Text = "New name pattern (the file extension is kept; nothing is ever overwritten):"
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.Text = $pat
+    $tb.Height = 28; $tb.FontSize = 14
+    $tb.VerticalContentAlignment = 'Center'
+    $tb.Margin = [System.Windows.Thickness]::new(0, 4, 0, 0)
+    $l2 = New-Object System.Windows.Controls.TextBlock
+    $l2.Text = "Tokens: {date} yyyymmdd (date taken, else file date)   {time} hhmmss   {title}   {subject}   {author}   {camera}   {rating}   {name} (old name)   {n} 001, 002...`nExamples: {date}_{title}    {date}_{time}    {date}_{subject}_{n}"
+    $l2.TextWrapping = 'Wrap'; $l2.FontSize = 11
+    $l2.Foreground = [System.Windows.Media.Brushes]::DimGray
+    $l2.Margin = [System.Windows.Thickness]::new(0, 6, 0, 8)
+    [void]$top.Children.Add($l1); [void]$top.Children.Add($tb); [void]$top.Children.Add($l2)
+    $bot = New-Object System.Windows.Controls.StackPanel
+    $bot.Orientation = 'Horizontal'
+    $bot.HorizontalAlignment = 'Right'
+    $bot.Margin = [System.Windows.Thickness]::new(0, 10, 0, 0)
+    [System.Windows.Controls.DockPanel]::SetDock($bot, [System.Windows.Controls.Dock]::Bottom)
+    $ok = New-Object System.Windows.Controls.Button
+    $ok.Content = 'Rename'; $ok.Width = 90; $ok.Height = 30; $ok.IsDefault = $true
+    $ok.Margin = [System.Windows.Thickness]::new(0, 0, 8, 0)
+    $cn = New-Object System.Windows.Controls.Button
+    $cn.Content = 'Cancel'; $cn.Width = 90; $cn.Height = 30; $cn.IsCancel = $true
+    [void]$bot.Children.Add($ok); [void]$bot.Children.Add($cn)
+    $sum = New-Object System.Windows.Controls.TextBlock
+    $sum.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
+    [System.Windows.Controls.DockPanel]::SetDock($sum, [System.Windows.Controls.Dock]::Bottom)
+    $lb = New-Object System.Windows.Controls.ListBox
+    $lb.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas')
+    $lb.FontSize = 12
+    [void]$dock.Children.Add($top); [void]$dock.Children.Add($bot); [void]$dock.Children.Add($sum); [void]$dock.Children.Add($lb)
+    $w.Content = $dock
+    $script:brWin = $w; $script:brTb = $tb; $script:brLb = $lb; $script:brSum = $sum; $script:brOk = $ok
+    Update-RenamePreview
+    $tb.Add_TextChanged({ Update-RenamePreview })
+    $ok.Add_Click({ $script:brWin.DialogResult = $true })
+    $tb.Focus() | Out-Null
+    $tb.CaretIndex = $tb.Text.Length
+    $res = $w.ShowDialog()
+    $txtStatus.Text = $script:folderStatus
+    if ($res -ne $true) { return }
+    $patNow = [string]$script:brTb.Text
+    Set-Setting 'RenamePattern' $patNow
+    $todo = @($script:brPlan | Where-Object { -not $_.Skip -and $_.New -cne $_.Old })
+    if ($todo.Count -eq 0) { return }
+
+    Stop-Thumbs
+    Stop-ColMeta
+    $done = 0; $errs = @()
+    foreach ($p in $todo) {
+        try {
+            $old = $p.Item.FullPath
+            $dir = [IO.Path]::GetDirectoryName($old)
+            $newFull = Join-Path $dir $p.New
+            Rename-Item -LiteralPath $old -NewName $p.New -ErrorAction Stop
+            if ((Get-XmpMode $p.Item) -eq 'sidecar') {
+                $ox = [IO.Path]::ChangeExtension($old, 'xmp')
+                $nx = [IO.Path]::GetFileName([IO.Path]::ChangeExtension($newFull, 'xmp'))
+                if ([IO.File]::Exists($ox)) { Rename-Item -LiteralPath $ox -NewName $nx -ErrorAction Stop }
+                if ([IO.File]::Exists($ox + '_original')) { Rename-Item -LiteralPath ($ox + '_original') -NewName ($nx + '_original') -ErrorAction Stop }
+            }
+            if ([IO.File]::Exists($old + '_original')) { Rename-Item -LiteralPath ($old + '_original') -NewName ($p.New + '_original') -ErrorAction Stop }
+            $done++
+        } catch { $errs += ($p.Old + ': ' + $_.Exception.Message) }
+    }
+    $script:metaReady = $false
+    if ($script:deepActive) { Apply-Search } else { Refresh-All }
+    $txtStatus.Text = "Renamed $done file(s)"
+    if ($errs.Count -gt 0) { [void](Msg ("Some files could not be renamed:`n`n" + ($errs -join "`n")) 'OK' 'Warning') }
+}
+
+# ---------- Toolbar buttons + right-click entry ----------
+try {
+    $s18Move = $win.FindName('btnMoveTo')
+    $s18Bar = $s18Move.Parent
+    $s18Idx = $s18Bar.Children.IndexOf($s18Move)
+    $btnUndo = New-Object System.Windows.Controls.Button
+    $btnUndo.Content = 'Undo save'
+    try { $btnUndo.Style = $win.FindResource('TB') } catch { }
+    $btnUndo.ToolTip = "Restore the selected files from their _original backups.`nNeeds KeepBackups = true in config.json."
+    $btnUndo.Add_Click({ Do-UndoSave })
+    $btnBR = New-Object System.Windows.Controls.Button
+    $btnBR.Content = 'Batch rename'
+    try { $btnBR.Style = $win.FindResource('TB') } catch { }
+    $btnBR.ToolTip = 'Rename the selected files from their metadata, e.g. {date}_{title}'
+    $btnBR.Add_Click({ Do-BatchRename })
+    $s18Bar.Children.Insert($s18Idx + 1, $btnUndo)
+    $s18Bar.Children.Insert($s18Idx + 2, $btnBR)
+} catch { Write-Log ('toolbar18: ' + $_.Exception.ToString()) }
+try {
+    $mi18 = New-Object System.Windows.Controls.MenuItem
+    $mi18.Header = 'Batch rename from metadata...'
+    $mi18.Add_Click({ Do-BatchRename })
+    $list.ContextMenu.Items.Insert(4, $mi18)
+} catch { }
+
+# ---------- Window title from $script:appVersion + red tile / green v3 window icon ----------
+function Update-WinTitle {
+    try {
+        $p = [string]$txtPath.Text
+        $t = 'MetadataEditor v' + $script:appVersion
+        if ($p) {
+            $leaf = [IO.Path]::GetFileName($p.TrimEnd('\'))
+            if (-not $leaf) { $leaf = $p }
+            $win.Title = "$leaf  -  $t"
+        } else { $win.Title = $t }
+    } catch { }
+}
+Update-WinTitle
+
+try {
+    $dv18 = New-Object System.Windows.Media.DrawingVisual
+    $dc18 = $dv18.RenderOpen()
+    $bg18 = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(198, 40, 40))
+    $dc18.DrawRoundedRectangle($bg18, $null, [System.Windows.Rect]::new(2, 2, 60, 60), 12, 12)
+    $gr18 = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(105, 240, 174))
+    $ft18 = New-Object System.Windows.Media.FormattedText('v3', [Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, (New-Object System.Windows.Media.Typeface('Segoe UI')), 36, $gr18)
+    $ft18.SetFontWeight([System.Windows.FontWeights]::Bold)
+    $dc18.DrawText($ft18, [System.Windows.Point]::new(32 - $ft18.Width / 2, 32 - $ft18.Height / 2))
+    $dc18.Close()
+    $rtb18 = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(64, 64, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb18.Render($dv18)
+    $rtb18.Freeze()
+    $win.Icon = $rtb18
+} catch { Write-Log ('icon18: ' + $_.Exception.Message) }
+
+# ---------- Help ----------
+$s18Help = @(
+'NEW IN THIS VERSION',
+'Exclude with a minus sign: -tag:holiday, -rating:>=3, -draft. Combine freely, for example tag:paris -tag:holiday ext:jpg.',
+'The Taken column is the date the photo was taken (from the file metadata). Created is the date the file was created on this computer, which changes when a file is copied. Comments is the XMP comment text.',
+'Undo save restores the selected files from their _original backups (KeepBackups must be true in config.json).',
+'Batch rename (button or right-click) renames the selected files from their metadata, for example {date}_{title}. It never overwrites: a clash gets _2, _3 added. RAW sidecar .xmp files and _original backups are renamed with their file.'
+) -join "`n"
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`n" + $s18Help + "`n`nPress F1 any time")
+# ===== END SCRIPT18 =====
 $win.ShowDialog() | Out-Null
 
 
