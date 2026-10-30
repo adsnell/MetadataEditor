@@ -3021,7 +3021,7 @@ $btnClearCache.Add_Click({ Clear-ThumbCache })
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nPOLISH`nThe Save button turns orange (and changed fields get an orange border) while you have unsaved edits. The status bar shows errors in red, hints in amber and completed actions in green. Column widths and pane sizes are remembered. In Thumbnails view, Clear cache deletes cached thumbnails (they rebuild by themselves; the cache is also trimmed automatically above 200 MB).`n`nPress F1 any time")
 # ===== END SCRIPT14 =====
 # ===== SCRIPT15-MARKER =====
-$script:appVersion = '3.0'
+$script:appVersion = '3.1'
 $script:donateUrl  = 'https://paypal.me/AndrewSnell791'
 
 function Get-AncestorOf($d, [type]$t) {
@@ -4456,6 +4456,42 @@ $s18Help = @(
 ) -join "`n"
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`n" + $s18Help + "`n`nPress F1 any time")
 # ===== END SCRIPT18 =====
+# ===== SCRIPT19-MARKER =====
+# ---------- Larger fonts: toolbar, left, centre and right panes ----------
+$script:fontBump = 2
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st19 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st19 -and $st19.FontBump -ne $null) { $script:fontBump = [Math]::Max(0, [Math]::Min(8, [double]$st19.FontBump)) }
+    }
+} catch { }
+
+function Bump-Fonts($el, [double]$d) {
+    if ($el -is [System.Windows.Controls.TextBox]) {
+        $el.FontSize = $el.FontSize + $d
+        if ($el.Height -gt 0) { $el.Height = $el.Height + 2 * $d }
+        return
+    }
+    if ($el -is [System.Windows.Controls.TextBlock] -or $el -is [System.Windows.Controls.Primitives.ButtonBase]) {
+        $el.FontSize = $el.FontSize + $d
+        return
+    }
+    if ($el -is [System.Windows.DependencyObject]) {
+        foreach ($c in [System.Windows.LogicalTreeHelper]::GetChildren($el)) {
+            if ($c -is [System.Windows.DependencyObject]) { Bump-Fonts $c $d }
+        }
+    }
+}
+
+if ($script:fontBump -gt 0) {
+    try {
+        Bump-Fonts $win.FindName('btnBack').Parent $script:fontBump    # toolbar
+        $tree.FontSize = $tree.FontSize + $script:fontBump              # left pane
+        $list.FontSize = $list.FontSize + $script:fontBump              # centre pane
+        Bump-Fonts $txtName.Parent $script:fontBump                     # right pane
+    } catch { Write-Log ('fontBump: ' + $_.Exception.ToString()) }
+}
+# ===== END SCRIPT19 =====
 $win.ShowDialog() | Out-Null
 
 

@@ -9,3 +9,4 @@ dist/
 settings.json
 *.zip
 *.bak*
+*.bak??

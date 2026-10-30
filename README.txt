@@ -1,4 +1,4 @@
-﻿METADATAEDITOR v2.1
+﻿METADATAEDITOR v3.1
 A free XMP metadata editor for Windows - free, with an optional donation.
 
 WHAT IT DOES
