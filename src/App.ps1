@@ -4492,6 +4492,569 @@ if ($script:fontBump -gt 0) {
     } catch { Write-Log ('fontBump: ' + $_.Exception.ToString()) }
 }
 # ===== END SCRIPT19 =====
+# ===== SCRIPT20-MARKER =====
+# ---------- 1. Warn before a save creates _original backup copies ----------
+function Confirm-BackupCopies($targets) {
+    if (-not $cfg.KeepBackups) { return 'normal' }
+    $new = @($targets | Where-Object { $_ -and -not [IO.File]::Exists($_ + '_original') }).Count
+    if ($new -eq 0) { return 'normal' }
+    $txt = "Backups are switched on (KeepBackups in config.json).`nThis save will create $new extra backup file(s) ending in _original next to your files.`n`nYes = save and keep the backup copies`nNo = save WITHOUT making backups`nCancel = do not save"
+    $r = Msg $txt 'YesNoCancel' 'Warning'
+    if ($r -eq 'Yes') { return 'normal' }
+    if ($r -eq 'No') { return 'nobackup' }
+    return 'cancel'
+}
+
+$script:prevInvokeXmpWrite20 = ${function:Invoke-XmpWrite}
+function Invoke-XmpWrite($sel, $changes, $label) {
+    $mode = 'normal'
+    try { $mode = Confirm-BackupCopies @(Get-Targets $sel) } catch { Write-Log ('backup prompt: ' + $_.Exception.Message) }
+    if ($mode -eq 'cancel') { $txtStatus.Text = 'Cancelled - nothing was changed.'; return }
+    $saved = $cfg.KeepBackups
+    if ($mode -eq 'nobackup') { $cfg.KeepBackups = $false }
+    try { & $script:prevInvokeXmpWrite20 $sel $changes $label }
+    finally { if ($mode -eq 'nobackup') { $cfg.KeepBackups = $saved } }
+}
+
+$script:prevSaveMetadata20 = ${function:Save-Metadata}
+function Save-Metadata {
+    $nb = $false
+    try {
+        if ($cfg.KeepBackups) {
+            $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir } | Where-Object { Get-XmpMode $_ })
+            $keys = @(); $bad = $false
+            foreach ($f in $fields) {
+                if ($f.Ctl.Text -ceq $script:loaded[$f.Key]) { continue }
+                $keys += $f.Key
+                if ($f.Key -eq 'Rating') { $nv = $f.Ctl.Text.Trim(); if ($nv -ne '' -and $nv -notmatch '^[0-5]$') { $bad = $true } }
+            }
+            if ($keys.Count -gt 0 -and -not $bad -and $sel.Count -gt 0) {
+                $tg = @()
+                $xs = @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })
+                if ($xs.Count -gt 0) { $tg += @(Get-Targets $xs) }
+                $officeKeys = @($keys | Where-Object { $_ -ne 'Rights' -and $_ -ne 'Rating' })
+                if ($officeKeys.Count -gt 0) { $tg += @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' } | ForEach-Object { $_.FullPath }) }
+                $mode = Confirm-BackupCopies $tg
+                if ($mode -eq 'cancel') { $txtStatus.Text = 'Cancelled - nothing was saved.'; return }
+                if ($mode -eq 'nobackup') { $nb = $true }
+            }
+        }
+    } catch { Write-Log ('backup prompt: ' + $_.Exception.Message) }
+    $saved = $cfg.KeepBackups
+    if ($nb) { $cfg.KeepBackups = $false }
+    try { & $script:prevSaveMetadata20 }
+    finally { if ($nb) { $cfg.KeepBackups = $saved } }
+}
+
+# ---------- 2. Copy / move: never overwrite silently; compare the two files ----------
+function Format-FileSize20([long]$b) {
+    if ($b -ge 1GB) { return ('{0:N2} GB ({1:N0} bytes)' -f ($b / 1GB), $b) }
+    if ($b -ge 1MB) { return ('{0:N1} MB ({1:N0} bytes)' -f ($b / 1MB), $b) }
+    if ($b -ge 1KB) { return ('{0:N0} KB ({1:N0} bytes)' -f ($b / 1KB), $b) }
+    return ('{0:N0} bytes' -f $b)
+}
+
+function Get-ConflictInfo([string]$p, [bool]$isDir) {
+    $r = @{}
+    if ($isDir) {
+        $di = New-Object IO.DirectoryInfo $p
+        $r.Len = 0
+        $r.Modified = $di.LastWriteTime
+        $r.Text1 = ('{0} item(s)' -f @([IO.Directory]::GetFileSystemEntries($p)).Count)
+    } else {
+        $fi = New-Object IO.FileInfo $p
+        $r.Len = $fi.Length
+        $r.Modified = $fi.LastWriteTime
+        $r.Text1 = Format-FileSize20 $fi.Length
+    }
+    $r.ModText = $r.Modified.ToString('d MMM yyyy HH:mm:ss')
+    $r.Folder = [IO.Path]::GetDirectoryName($p)
+    return $r
+}
+
+function New-GridCell20($grid, [string]$text, [int]$row, [int]$col, [bool]$bold, [string]$tip) {
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $text
+    $tb.Margin = [System.Windows.Thickness]::new(0, 2, 14, 2)
+    $tb.MaxWidth = 250
+    $tb.TextTrimming = 'CharacterEllipsis'
+    if ($bold) { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
+    if ($tip) { $tb.ToolTip = $tip }
+    [System.Windows.Controls.Grid]::SetRow($tb, $row)
+    [System.Windows.Controls.Grid]::SetColumn($tb, $col)
+    [void]$grid.Children.Add($tb)
+}
+
+function Show-ConflictDialog([string]$src, [string]$dst, [bool]$isDir) {
+    if ($script:xfAll) { return @{ Choice = $script:xfAll; All = $true } }
+    $ei = Get-ConflictInfo $dst $isDir
+    $si = Get-ConflictInfo $src $isDir
+    $name = [IO.Path]::GetFileName($dst)
+
+    $w = New-Object System.Windows.Window
+    if ($isDir) { $w.Title = 'Folder already exists' } else { $w.Title = 'File already exists' }
+    $w.SizeToContent = 'WidthAndHeight'
+    $w.MinWidth = 620
+    $w.ResizeMode = 'NoResize'
+    $w.Owner = $win
+    $w.WindowStartupLocation = 'CenterOwner'
+
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Margin = [System.Windows.Thickness]::new(18)
+    $h = New-Object System.Windows.Controls.TextBlock
+    $h.Text = "'$name' already exists in the destination."
+    $h.FontSize = 15
+    $h.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $h.TextWrapping = 'Wrap'
+    $h.MaxWidth = 640
+    $h.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
+    [void]$sp.Children.Add($h)
+
+    $g = New-Object System.Windows.Controls.Grid
+    $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = [System.Windows.GridLength]::Auto
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::new(270)
+    $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = [System.Windows.GridLength]::new(270)
+    [void]$g.ColumnDefinitions.Add($c0); [void]$g.ColumnDefinitions.Add($c1); [void]$g.ColumnDefinitions.Add($c2)
+    for ($i = 0; $i -lt 4; $i++) {
+        $rd = New-Object System.Windows.Controls.RowDefinition; $rd.Height = [System.Windows.GridLength]::Auto
+        [void]$g.RowDefinitions.Add($rd)
+    }
+    New-GridCell20 $g '' 0 0 $false ''
+    New-GridCell20 $g 'Already there' 0 1 $true ''
+    New-GridCell20 $g 'Incoming' 0 2 $true ''
+    New-GridCell20 $g 'Folder' 1 0 $true ''
+    New-GridCell20 $g $ei.Folder 1 1 $false $ei.Folder
+    New-GridCell20 $g $si.Folder 1 2 $false $si.Folder
+    if ($isDir) { $lab = 'Contains' } else { $lab = 'Size' }
+    New-GridCell20 $g $lab 2 0 $true ''
+    New-GridCell20 $g $ei.Text1 2 1 $false ''
+    New-GridCell20 $g $si.Text1 2 2 $false ''
+    New-GridCell20 $g 'Modified' 3 0 $true ''
+    New-GridCell20 $g $ei.ModText 3 1 $false ''
+    New-GridCell20 $g $si.ModText 3 2 $false ''
+    [void]$sp.Children.Add($g)
+
+    $noteText = ''
+    if (-not $isDir) {
+        $secs = ($si.Modified - $ei.Modified).TotalSeconds
+        $bits = @()
+        if ($secs -gt 2) { $bits += 'newer' } elseif ($secs -lt -2) { $bits += 'older' }
+        if ($si.Len -gt $ei.Len) { $bits += 'larger' } elseif ($si.Len -lt $ei.Len) { $bits += 'smaller' }
+        if ($bits.Count -eq 0) { $noteText = 'Both files have the same size and date - they are probably identical.' }
+        else { $noteText = 'The incoming file is ' + ($bits -join ' and ') + ' than the one already there.' }
+        $noteText = $noteText.Replace('newer than', 'newer than').Replace('older and', 'older and')
+    }
+    if ($noteText) {
+        $nt = New-Object System.Windows.Controls.TextBlock
+        $nt.Text = $noteText
+        $nt.TextWrapping = 'Wrap'; $nt.MaxWidth = 640
+        $nt.Margin = [System.Windows.Thickness]::new(0, 10, 0, 0)
+        [void]$sp.Children.Add($nt)
+    }
+    $tp = New-Object System.Windows.Controls.TextBlock
+    if ($isDir) { $tp.Text = 'Merge copies the contents in; you are asked about each file that clashes. Keep both gives the incoming folder a new name.' }
+    else { $tp.Text = 'Replace sends the existing file to the Recycle Bin first, so you can get it back. Keep both gives the incoming file a new name.' }
+    $tp.TextWrapping = 'Wrap'; $tp.MaxWidth = 640
+    $tp.Foreground = [System.Windows.Media.Brushes]::DimGray
+    $tp.FontSize = 12
+    $tp.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
+    [void]$sp.Children.Add($tp)
+
+    $chk = New-Object System.Windows.Controls.CheckBox
+    $chk.Content = 'Do this for all remaining conflicts'
+    $chk.Margin = [System.Windows.Thickness]::new(0, 12, 0, 0)
+    [void]$sp.Children.Add($chk)
+
+    $bp = New-Object System.Windows.Controls.StackPanel
+    $bp.Orientation = 'Horizontal'
+    $bp.HorizontalAlignment = 'Right'
+    $bp.Margin = [System.Windows.Thickness]::new(0, 14, 0, 0)
+    $mk = {
+        param($text)
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = $text; $b.Width = 100; $b.Height = 30
+        $b.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+        return $b
+    }
+    if ($isDir) { $rtxt = 'Merge' } else { $rtxt = 'Replace' }
+    $bR = & $mk $rtxt
+    $bB = & $mk 'Keep both'; $bB.IsDefault = $true
+    $bS = & $mk 'Skip'
+    $bC = & $mk 'Cancel'; $bC.IsCancel = $true
+    $script:xfWin = $w; $script:xfChk = $chk; $script:xfChoice = 'cancel'
+    $bR.Add_Click({ $script:xfChoice = 'replace'; $script:xfWin.Close() })
+    $bB.Add_Click({ $script:xfChoice = 'both'; $script:xfWin.Close() })
+    $bS.Add_Click({ $script:xfChoice = 'skip'; $script:xfWin.Close() })
+    $bC.Add_Click({ $script:xfChoice = 'cancel'; $script:xfWin.Close() })
+    foreach ($b in @($bR, $bB, $bS, $bC)) { [void]$bp.Children.Add($b) }
+    [void]$sp.Children.Add($bp)
+    $w.Content = $sp
+    [void]$w.ShowDialog()
+
+    $res = @{ Choice = $script:xfChoice; All = [bool]$script:xfChk.IsChecked }
+    if ($res.All -and $res.Choice -ne 'cancel') { $script:xfAll = $res.Choice }
+    return $res
+}
+
+function Do-Xfer([string]$src, [string]$target, [bool]$isDir, [bool]$move) {
+    if ($move) { Move-Item -LiteralPath $src -Destination $target | Out-Null }
+    else { Copy-Item -LiteralPath $src -Destination $target -Recurse | Out-Null }
+}
+
+function Merge-Folder([string]$srcDir, [string]$dstDir, [bool]$move) {
+    foreach ($child in @([IO.Directory]::GetFileSystemEntries($srcDir))) {
+        $cn = [IO.Path]::GetFileName($child)
+        $cIsDir = [IO.Directory]::Exists($child)
+        $r = Transfer-One $child $dstDir $cn $cIsDir $move $false
+        if ($r -eq 'cancel') { return 'cancel' }
+    }
+    if ($move -and @([IO.Directory]::GetFileSystemEntries($srcDir)).Count -eq 0) {
+        try { [IO.Directory]::Delete($srcDir) } catch { }
+    }
+    return 'done'
+}
+
+function Transfer-One([string]$srcTrim, [string]$destDir, [string]$name, [bool]$isDir, [bool]$move, [bool]$sameDir) {
+    $target = Join-Path $destDir $name
+    $tIsDir = [IO.Directory]::Exists($target)
+    $exists = ($tIsDir -or [IO.File]::Exists($target))
+    if (-not $exists) { Do-Xfer $srcTrim $target $isDir $move; return 'done' }
+    if ($sameDir -or ($isDir -ne $tIsDir)) {
+        $t2 = Get-UniquePath $destDir $name $isDir
+        Do-Xfer $srcTrim $t2 $isDir $move
+        return 'done'
+    }
+    $d = Show-ConflictDialog $srcTrim $target $isDir
+    $c = $d.Choice
+    if ($c -eq 'cancel') { return 'cancel' }
+    if ($c -eq 'skip') { $script:xfSkipped++; return 'skip' }
+    if ($c -eq 'both') {
+        $t2 = Get-UniquePath $destDir $name $isDir
+        Do-Xfer $srcTrim $t2 $isDir $move
+        return 'done'
+    }
+    if ($isDir) { return (Merge-Folder $srcTrim $target $move) }
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    Do-Xfer $srcTrim $target $false $move
+    $script:xfReplaced++
+    return 'done'
+}
+
+function Transfer-Items($paths, $dest, $move) {
+    Stop-Thumbs
+    $script:xfAll = $null; $script:xfReplaced = 0; $script:xfSkipped = 0
+    $errors = @(); $done = 0; $cancelled = $false
+    foreach ($src in $paths) {
+        $name = $src
+        try {
+            $srcTrim = $src.TrimEnd('\')
+            $isDir = [IO.Directory]::Exists($srcTrim)
+            $name = [IO.Path]::GetFileName($srcTrim)
+            if ($isDir -and ($dest.TrimEnd('\') + '\').StartsWith($srcTrim + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Cannot copy or move a folder into itself.'
+            }
+            $srcDir = [IO.Path]::GetDirectoryName($srcTrim)
+            $sameDir = ($srcDir.TrimEnd('\') -ieq $dest.TrimEnd('\'))
+            if ($move -and $sameDir) { continue }
+            $r = Transfer-One $srcTrim $dest $name $isDir $move $sameDir
+            if ($r -eq 'done') { $done++ }
+            elseif ($r -eq 'cancel') { $cancelled = $true; break }
+        } catch { $errors += "${name}: $($_.Exception.Message)" }
+    }
+    Refresh-All
+    if ($move) { $verb = 'Moved' } else { $verb = 'Copied' }
+    $msg = "$verb $done item(s)"
+    if ($script:xfReplaced -gt 0) { $msg += ", replaced $($script:xfReplaced)" }
+    if ($script:xfSkipped -gt 0) { $msg += ", skipped $($script:xfSkipped)" }
+    if ($cancelled) { $msg = 'Cancelled - ' + $msg + ' before cancelling' }
+    $txtStatus.Text = $msg
+    if ($errors.Count -gt 0) { [void](Msg ("Some items failed:`n`n" + ($errors -join "`n")) 'OK' 'Warning') }
+}
+
+# ---------- Help ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nCOPYING AND MOVING`nIf the destination already has an item with the same name, a window compares the two (size and date) and asks: Replace, Keep both, Skip or Cancel. For a folder you can Merge. Replace sends the old file to the Recycle Bin first. Tick the box to use your answer for all remaining conflicts. Nothing is overwritten without asking.`n`nBACKUP COPIES`nIf KeepBackups is on, you are asked before a save creates _original copies: Yes keeps them, No saves without them, Cancel stops.`n`nPress F1 any time")
+# ===== END SCRIPT20 =====
+# ===== SCRIPT20-MARKER =====
+# ---------- 1. Warn before a save creates _original backup copies ----------
+function Confirm-BackupCopies($targets) {
+    if (-not $cfg.KeepBackups) { return 'normal' }
+    $new = @($targets | Where-Object { $_ -and -not [IO.File]::Exists($_ + '_original') }).Count
+    if ($new -eq 0) { return 'normal' }
+    $txt = "Backups are switched on (KeepBackups in config.json).`nThis save will create $new extra backup file(s) ending in _original next to your files.`n`nYes = save and keep the backup copies`nNo = save WITHOUT making backups`nCancel = do not save"
+    $r = Msg $txt 'YesNoCancel' 'Warning'
+    if ($r -eq 'Yes') { return 'normal' }
+    if ($r -eq 'No') { return 'nobackup' }
+    return 'cancel'
+}
+
+$script:prevInvokeXmpWrite20 = ${function:Invoke-XmpWrite}
+function Invoke-XmpWrite($sel, $changes, $label) {
+    $mode = 'normal'
+    try { $mode = Confirm-BackupCopies @(Get-Targets $sel) } catch { Write-Log ('backup prompt: ' + $_.Exception.Message) }
+    if ($mode -eq 'cancel') { $txtStatus.Text = 'Cancelled - nothing was changed.'; return }
+    $saved = $cfg.KeepBackups
+    if ($mode -eq 'nobackup') { $cfg.KeepBackups = $false }
+    try { & $script:prevInvokeXmpWrite20 $sel $changes $label }
+    finally { if ($mode -eq 'nobackup') { $cfg.KeepBackups = $saved } }
+}
+
+$script:prevSaveMetadata20 = ${function:Save-Metadata}
+function Save-Metadata {
+    $nb = $false
+    try {
+        if ($cfg.KeepBackups) {
+            $sel = @($list.SelectedItems | Where-Object { -not $_.IsDir } | Where-Object { Get-XmpMode $_ })
+            $keys = @(); $bad = $false
+            foreach ($f in $fields) {
+                if ($f.Ctl.Text -ceq $script:loaded[$f.Key]) { continue }
+                $keys += $f.Key
+                if ($f.Key -eq 'Rating') { $nv = $f.Ctl.Text.Trim(); if ($nv -ne '' -and $nv -notmatch '^[0-5]$') { $bad = $true } }
+            }
+            if ($keys.Count -gt 0 -and -not $bad -and $sel.Count -gt 0) {
+                $tg = @()
+                $xs = @($sel | Where-Object { (Get-XmpMode $_) -ne 'office' })
+                if ($xs.Count -gt 0) { $tg += @(Get-Targets $xs) }
+                $officeKeys = @($keys | Where-Object { $_ -ne 'Rights' -and $_ -ne 'Rating' })
+                if ($officeKeys.Count -gt 0) { $tg += @($sel | Where-Object { (Get-XmpMode $_) -eq 'office' } | ForEach-Object { $_.FullPath }) }
+                $mode = Confirm-BackupCopies $tg
+                if ($mode -eq 'cancel') { $txtStatus.Text = 'Cancelled - nothing was saved.'; return }
+                if ($mode -eq 'nobackup') { $nb = $true }
+            }
+        }
+    } catch { Write-Log ('backup prompt: ' + $_.Exception.Message) }
+    $saved = $cfg.KeepBackups
+    if ($nb) { $cfg.KeepBackups = $false }
+    try { & $script:prevSaveMetadata20 }
+    finally { if ($nb) { $cfg.KeepBackups = $saved } }
+}
+
+# ---------- 2. Copy / move: never overwrite silently; compare the two files ----------
+function Format-FileSize20([long]$b) {
+    if ($b -ge 1GB) { return ('{0:N2} GB ({1:N0} bytes)' -f ($b / 1GB), $b) }
+    if ($b -ge 1MB) { return ('{0:N1} MB ({1:N0} bytes)' -f ($b / 1MB), $b) }
+    if ($b -ge 1KB) { return ('{0:N0} KB ({1:N0} bytes)' -f ($b / 1KB), $b) }
+    return ('{0:N0} bytes' -f $b)
+}
+
+function Get-ConflictInfo([string]$p, [bool]$isDir) {
+    $r = @{}
+    if ($isDir) {
+        $di = New-Object IO.DirectoryInfo $p
+        $r.Len = 0
+        $r.Modified = $di.LastWriteTime
+        $r.Text1 = ('{0} item(s)' -f @([IO.Directory]::GetFileSystemEntries($p)).Count)
+    } else {
+        $fi = New-Object IO.FileInfo $p
+        $r.Len = $fi.Length
+        $r.Modified = $fi.LastWriteTime
+        $r.Text1 = Format-FileSize20 $fi.Length
+    }
+    $r.ModText = $r.Modified.ToString('d MMM yyyy HH:mm:ss')
+    $r.Folder = [IO.Path]::GetDirectoryName($p)
+    return $r
+}
+
+function New-GridCell20($grid, [string]$text, [int]$row, [int]$col, [bool]$bold, [string]$tip) {
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $text
+    $tb.Margin = [System.Windows.Thickness]::new(0, 2, 14, 2)
+    $tb.MaxWidth = 250
+    $tb.TextTrimming = 'CharacterEllipsis'
+    if ($bold) { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
+    if ($tip) { $tb.ToolTip = $tip }
+    [System.Windows.Controls.Grid]::SetRow($tb, $row)
+    [System.Windows.Controls.Grid]::SetColumn($tb, $col)
+    [void]$grid.Children.Add($tb)
+}
+
+function Show-ConflictDialog([string]$src, [string]$dst, [bool]$isDir) {
+    if ($script:xfAll) { return @{ Choice = $script:xfAll; All = $true } }
+    $ei = Get-ConflictInfo $dst $isDir
+    $si = Get-ConflictInfo $src $isDir
+    $name = [IO.Path]::GetFileName($dst)
+
+    $w = New-Object System.Windows.Window
+    if ($isDir) { $w.Title = 'Folder already exists' } else { $w.Title = 'File already exists' }
+    $w.SizeToContent = 'WidthAndHeight'
+    $w.MinWidth = 620
+    $w.ResizeMode = 'NoResize'
+    $w.Owner = $win
+    $w.WindowStartupLocation = 'CenterOwner'
+
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Margin = [System.Windows.Thickness]::new(18)
+    $h = New-Object System.Windows.Controls.TextBlock
+    $h.Text = "'$name' already exists in the destination."
+    $h.FontSize = 15
+    $h.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $h.TextWrapping = 'Wrap'
+    $h.MaxWidth = 640
+    $h.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
+    [void]$sp.Children.Add($h)
+
+    $g = New-Object System.Windows.Controls.Grid
+    $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = [System.Windows.GridLength]::Auto
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::new(270)
+    $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = [System.Windows.GridLength]::new(270)
+    [void]$g.ColumnDefinitions.Add($c0); [void]$g.ColumnDefinitions.Add($c1); [void]$g.ColumnDefinitions.Add($c2)
+    for ($i = 0; $i -lt 4; $i++) {
+        $rd = New-Object System.Windows.Controls.RowDefinition; $rd.Height = [System.Windows.GridLength]::Auto
+        [void]$g.RowDefinitions.Add($rd)
+    }
+    New-GridCell20 $g '' 0 0 $false ''
+    New-GridCell20 $g 'Already there' 0 1 $true ''
+    New-GridCell20 $g 'Incoming' 0 2 $true ''
+    New-GridCell20 $g 'Folder' 1 0 $true ''
+    New-GridCell20 $g $ei.Folder 1 1 $false $ei.Folder
+    New-GridCell20 $g $si.Folder 1 2 $false $si.Folder
+    if ($isDir) { $lab = 'Contains' } else { $lab = 'Size' }
+    New-GridCell20 $g $lab 2 0 $true ''
+    New-GridCell20 $g $ei.Text1 2 1 $false ''
+    New-GridCell20 $g $si.Text1 2 2 $false ''
+    New-GridCell20 $g 'Modified' 3 0 $true ''
+    New-GridCell20 $g $ei.ModText 3 1 $false ''
+    New-GridCell20 $g $si.ModText 3 2 $false ''
+    [void]$sp.Children.Add($g)
+
+    $noteText = ''
+    if (-not $isDir) {
+        $secs = ($si.Modified - $ei.Modified).TotalSeconds
+        $bits = @()
+        if ($secs -gt 2) { $bits += 'newer' } elseif ($secs -lt -2) { $bits += 'older' }
+        if ($si.Len -gt $ei.Len) { $bits += 'larger' } elseif ($si.Len -lt $ei.Len) { $bits += 'smaller' }
+        if ($bits.Count -eq 0) { $noteText = 'Both files have the same size and date - they are probably identical.' }
+        else { $noteText = 'The incoming file is ' + ($bits -join ' and ') + ' than the one already there.' }
+    }
+    if ($noteText) {
+        $nt = New-Object System.Windows.Controls.TextBlock
+        $nt.Text = $noteText
+        $nt.TextWrapping = 'Wrap'; $nt.MaxWidth = 640
+        $nt.Margin = [System.Windows.Thickness]::new(0, 10, 0, 0)
+        [void]$sp.Children.Add($nt)
+    }
+    $tp = New-Object System.Windows.Controls.TextBlock
+    if ($isDir) { $tp.Text = 'Merge copies the contents in; you are asked about each file that clashes. Keep both gives the incoming folder a new name.' }
+    else { $tp.Text = 'Replace sends the existing file to the Recycle Bin first, so you can get it back. Keep both gives the incoming file a new name.' }
+    $tp.TextWrapping = 'Wrap'; $tp.MaxWidth = 640
+    $tp.Foreground = [System.Windows.Media.Brushes]::DimGray
+    $tp.FontSize = 12
+    $tp.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
+    [void]$sp.Children.Add($tp)
+
+    $chk = New-Object System.Windows.Controls.CheckBox
+    $chk.Content = 'Do this for all remaining conflicts'
+    $chk.Margin = [System.Windows.Thickness]::new(0, 12, 0, 0)
+    [void]$sp.Children.Add($chk)
+
+    $bp = New-Object System.Windows.Controls.StackPanel
+    $bp.Orientation = 'Horizontal'
+    $bp.HorizontalAlignment = 'Right'
+    $bp.Margin = [System.Windows.Thickness]::new(0, 14, 0, 0)
+    $mk = {
+        param($text)
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = $text; $b.Width = 100; $b.Height = 30
+        $b.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+        return $b
+    }
+    if ($isDir) { $rtxt = 'Merge' } else { $rtxt = 'Replace' }
+    $bR = & $mk $rtxt
+    $bB = & $mk 'Keep both'; $bB.IsDefault = $true
+    $bS = & $mk 'Skip'
+    $bC = & $mk 'Cancel'; $bC.IsCancel = $true
+    $script:xfWin = $w; $script:xfChk = $chk; $script:xfChoice = 'cancel'
+    $bR.Add_Click({ $script:xfChoice = 'replace'; $script:xfWin.Close() })
+    $bB.Add_Click({ $script:xfChoice = 'both'; $script:xfWin.Close() })
+    $bS.Add_Click({ $script:xfChoice = 'skip'; $script:xfWin.Close() })
+    $bC.Add_Click({ $script:xfChoice = 'cancel'; $script:xfWin.Close() })
+    foreach ($b in @($bR, $bB, $bS, $bC)) { [void]$bp.Children.Add($b) }
+    [void]$sp.Children.Add($bp)
+    $w.Content = $sp
+    [void]$w.ShowDialog()
+
+    $res = @{ Choice = $script:xfChoice; All = [bool]$script:xfChk.IsChecked }
+    if ($res.All -and $res.Choice -ne 'cancel') { $script:xfAll = $res.Choice }
+    return $res
+}
+
+function Do-Xfer([string]$src, [string]$target, [bool]$isDir, [bool]$move) {
+    if ($move) { Move-Item -LiteralPath $src -Destination $target | Out-Null }
+    else { Copy-Item -LiteralPath $src -Destination $target -Recurse | Out-Null }
+}
+
+function Merge-Folder([string]$srcDir, [string]$dstDir, [bool]$move) {
+    foreach ($child in @([IO.Directory]::GetFileSystemEntries($srcDir))) {
+        $cn = [IO.Path]::GetFileName($child)
+        $cIsDir = [IO.Directory]::Exists($child)
+        $r = Transfer-One $child $dstDir $cn $cIsDir $move $false
+        if ($r -eq 'cancel') { return 'cancel' }
+    }
+    if ($move -and @([IO.Directory]::GetFileSystemEntries($srcDir)).Count -eq 0) {
+        try { [IO.Directory]::Delete($srcDir) } catch { }
+    }
+    return 'done'
+}
+
+function Transfer-One([string]$srcTrim, [string]$destDir, [string]$name, [bool]$isDir, [bool]$move, [bool]$sameDir) {
+    $target = Join-Path $destDir $name
+    $tIsDir = [IO.Directory]::Exists($target)
+    $exists = ($tIsDir -or [IO.File]::Exists($target))
+    if (-not $exists) { Do-Xfer $srcTrim $target $isDir $move; return 'done' }
+    if ($sameDir -or ($isDir -ne $tIsDir)) {
+        $t2 = Get-UniquePath $destDir $name $isDir
+        Do-Xfer $srcTrim $t2 $isDir $move
+        return 'done'
+    }
+    $d = Show-ConflictDialog $srcTrim $target $isDir
+    $c = $d.Choice
+    if ($c -eq 'cancel') { return 'cancel' }
+    if ($c -eq 'skip') { $script:xfSkipped++; return 'skip' }
+    if ($c -eq 'both') {
+        $t2 = Get-UniquePath $destDir $name $isDir
+        Do-Xfer $srcTrim $t2 $isDir $move
+        return 'done'
+    }
+    if ($isDir) { return (Merge-Folder $srcTrim $target $move) }
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    Do-Xfer $srcTrim $target $false $move
+    $script:xfReplaced++
+    return 'done'
+}
+
+function Transfer-Items($paths, $dest, $move) {
+    Stop-Thumbs
+    $script:xfAll = $null; $script:xfReplaced = 0; $script:xfSkipped = 0
+    $errors = @(); $done = 0; $cancelled = $false
+    foreach ($src in $paths) {
+        $name = $src
+        try {
+            $srcTrim = $src.TrimEnd('\')
+            $isDir = [IO.Directory]::Exists($srcTrim)
+            $name = [IO.Path]::GetFileName($srcTrim)
+            if ($isDir -and ($dest.TrimEnd('\') + '\').StartsWith($srcTrim + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Cannot copy or move a folder into itself.'
+            }
+            $srcDir = [IO.Path]::GetDirectoryName($srcTrim)
+            $sameDir = ($srcDir.TrimEnd('\') -ieq $dest.TrimEnd('\'))
+            if ($move -and $sameDir) { continue }
+            $r = Transfer-One $srcTrim $dest $name $isDir $move $sameDir
+            if ($r -eq 'done') { $done++ }
+            elseif ($r -eq 'cancel') { $cancelled = $true; break }
+        } catch { $errors += "${name}: $($_.Exception.Message)" }
+    }
+    Refresh-All
+    if ($move) { $verb = 'Moved' } else { $verb = 'Copied' }
+    $msg = "$verb $done item(s)"
+    if ($script:xfReplaced -gt 0) { $msg += ", replaced $($script:xfReplaced)" }
+    if ($script:xfSkipped -gt 0) { $msg += ", skipped $($script:xfSkipped)" }
+    if ($cancelled) { $msg = 'Cancelled - ' + $msg + ' before cancelling' }
+    $txtStatus.Text = $msg
+    if ($errors.Count -gt 0) { [void](Msg ("Some items failed:`n`n" + ($errors -join "`n")) 'OK' 'Warning') }
+}
+
+# ---------- Help ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nCOPYING AND MOVING`nIf the destination already has an item with the same name, a window compares the two (size and date) and asks: Replace, Keep both, Skip or Cancel. For a folder you can Merge. Replace sends the old file to the Recycle Bin first. Tick the box to use your answer for all remaining conflicts. Nothing is overwritten without asking.`n`nBACKUP COPIES`nIf KeepBackups is on, you are asked before a save creates _original copies: Yes keeps them, No saves without them, Cancel stops.`n`nPress F1 any time")
+# ===== END SCRIPT20 =====
 $win.ShowDialog() | Out-Null
 
 
