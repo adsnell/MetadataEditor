@@ -1394,6 +1394,48 @@ public class DeepWalker2 {
     }
 
     public int FileCount { get { return files.Length; } }
+    public void StartMulti(string[] roots, bool recurse, int max, string[] exts) {
+        th = new Thread(delegate() {
+            Dictionary<string, bool> ext = new Dictionary<string, bool>();
+            foreach (string e in exts) ext[e.ToLowerInvariant()] = true;
+            List<string> all = new List<string>();
+            List<string> read = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Stack<string> dirs = new Stack<string>();
+            for (int r = roots.Length - 1; r >= 0; r--) dirs.Push(roots[r]);
+            while (dirs.Count > 0 && !stop) {
+                string d = dirs.Pop();
+                if (!seen.Add(d.TrimEnd('\\'))) continue;
+                DirectoryInfo di = new DirectoryInfo(d);
+                try {
+                    foreach (FileInfo fi in di.EnumerateFiles()) {
+                        all.Add(fi.FullName);
+                        int a = (int)fi.Attributes;
+                        bool cloud = (a & 0x441000) != 0;
+                        if (!cloud && ext.ContainsKey(fi.Extension.TrimStart('.').ToLowerInvariant())) read.Add(fi.FullName);
+                    }
+                } catch { }
+                Count = all.Count;
+                if (all.Count >= max) break;
+                if (!recurse) continue;
+                try {
+                    foreach (DirectoryInfo sd in di.EnumerateDirectories()) {
+                        int sa = (int)sd.Attributes;
+                        bool reparse = (sa & 0x400) != 0;
+                        bool cloudDir = (sa & 0x440000) != 0;
+                        if (reparse && !cloudDir) continue;
+                        dirs.Push(sd.FullName);
+                    }
+                } catch { }
+            }
+            files = all.ToArray();
+            readable = read.ToArray();
+            Done = true;
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
+
     public string[] Readable { get { return readable; } }
     public void Stop() { stop = true; }
 
@@ -4773,6 +4815,864 @@ function Transfer-Items($paths, $dest, $move) {
 # ---------- Help ----------
 $script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nCOPYING AND MOVING`nIf the destination already has an item with the same name, a window compares the two (size and date) and asks: Replace, Keep both, Skip or Cancel. For a folder you can Merge. Replace sends the old file to the Recycle Bin first. Tick the box to use your answer for all remaining conflicts. Nothing is overwritten without asking.`n`nBACKUP COPIES`nIf KeepBackups is on, you are asked before a save creates _original copies: Yes keeps them, No saves without them, Cancel stops.`n`nPress F1 any time")
 # ===== END SCRIPT20 =====
+# ===== SCRIPT21-MARKER =====
+# ---------- Search several folders at once (the "folder list") ----------
+$script:searchFolders = @()
+$script:multiActive = $false
+$script:deepKey = ''
+$script:treeCtxPath = $null
+
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st21 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st21 -and $st21.SearchFolders) {
+            $script:searchFolders = @(@($st21.SearchFolders) | Where-Object { $_ -and [IO.Directory]::Exists([string]$_) } | ForEach-Object { [string]$_ })
+        }
+    }
+} catch { }
+
+$chkMulti = New-Object System.Windows.Controls.CheckBox
+$chkMulti.Content = 'Folder list (0)'
+$chkMulti.FontSize = 12 + [double]$script:fontBump
+$chkMulti.VerticalAlignment = 'Center'
+$chkMulti.Margin = [System.Windows.Thickness]::new(0, 0, 12, 0)
+$chkMulti.IsEnabled = $false
+[System.Windows.Controls.DockPanel]::SetDock($chkMulti, [System.Windows.Controls.Dock]::Right)
+[void]$txtSearch.Parent.Children.Add($chkMulti)
+$chkSub.ToolTip = "Search this folder and everything below it.`nWith 'Folder list' ticked: everything below each listed folder."
+
+function Test-MultiScope { return ([bool]$chkMulti.IsChecked -and @($script:searchFolders).Count -gt 0) }
+
+function ConvertTo-FolderKey([string]$p) {
+    try { $fp = [IO.Path]::GetFullPath($p) } catch { return $null }
+    if ($fp.Length -gt 3) { $fp = $fp.TrimEnd('\') }
+    return $fp
+}
+
+function Test-InSearchList([string]$p) {
+    $k = ConvertTo-FolderKey $p
+    if (-not $k) { return $false }
+    foreach ($f in @($script:searchFolders)) { if ($f -ieq $k) { return $true } }
+    return $false
+}
+
+function Update-FolderListUi {
+    $n = @($script:searchFolders).Count
+    $chkMulti.Content = "Folder list ($n)"
+    $chkMulti.IsEnabled = ($n -gt 0)
+    if ($n -eq 0) {
+        $chkMulti.IsChecked = $false
+        $chkMulti.ToolTip = "No folders in the list yet.`nRight-click a folder in the left pane, or select folders in the middle pane and right-click, then choose Add to search folders."
+    } else {
+        $chkMulti.ToolTip = "Search only these folders (tick Subfolders to include everything below each one):`n" + (@($script:searchFolders) -join "`n") + "`n`nRight-click for Edit / Clear."
+    }
+}
+
+function Add-SearchFolders($paths, [bool]$rerun = $true) {
+    $cur = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($c in @($script:searchFolders)) { $cur.Add([string]$c) }
+    $added = 0
+    foreach ($p in @($paths)) {
+        $fp = ConvertTo-FolderKey ([string]$p)
+        if (-not $fp -or -not [IO.Directory]::Exists($fp)) { continue }
+        $dup = $false
+        foreach ($c in $cur) { if ($c -ieq $fp) { $dup = $true; break } }
+        if (-not $dup) { $cur.Add($fp); $added++ }
+    }
+    $script:searchFolders = $cur.ToArray()
+    Set-Setting 'SearchFolders' ([string[]]$script:searchFolders)
+    Update-FolderListUi
+    if ($added -gt 0) { $chkMulti.IsChecked = $true }
+    $n = $cur.Count
+    if ($added -eq 0) { $txtStatus.Text = "Already in the search list ($n folder(s))" }
+    else { $txtStatus.Text = "Added $added folder(s) - the search list now has $n. Searches use the list while 'Folder list' is ticked." }
+    if ($rerun -and $added -gt 0 -and $txtSearch.Text.Trim()) { $searchTimer.Stop(); Apply-Search }
+}
+
+function Remove-SearchFolders($paths, [bool]$rerun = $true) {
+    $rm = @(@($paths) | ForEach-Object { ConvertTo-FolderKey ([string]$_) } | Where-Object { $_ })
+    $keep = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($f in @($script:searchFolders)) {
+        $hit = $false
+        foreach ($r in $rm) { if ($f -ieq $r) { $hit = $true; break } }
+        if (-not $hit) { $keep.Add($f) }
+    }
+    $script:searchFolders = $keep.ToArray()
+    Set-Setting 'SearchFolders' ([string[]]$script:searchFolders)
+    Update-FolderListUi
+    $txtStatus.Text = "Search list now has $($keep.Count) folder(s)"
+    if ($rerun -and $txtSearch.Text.Trim()) { $searchTimer.Stop(); Apply-Search }
+}
+
+function Clear-SearchFolders([bool]$rerun = $true) {
+    $script:searchFolders = @()
+    Set-Setting 'SearchFolders' ([string[]]@())
+    Update-FolderListUi
+    $txtStatus.Text = 'Search list cleared'
+    if ($rerun -and $txtSearch.Text.Trim()) { $searchTimer.Stop(); Apply-Search }
+}
+
+function Update-FolderDlgList {
+    $script:fdLb.Items.Clear()
+    foreach ($f in @($script:searchFolders)) { [void]$script:fdLb.Items.Add($f) }
+}
+
+function Show-FolderListDialog {
+    $script:fdChanged = $false
+    $w = New-Object System.Windows.Window
+    $w.Title = 'Search folders'
+    $w.Width = 660; $w.Height = 440
+    $w.Owner = $win
+    $w.WindowStartupLocation = 'CenterOwner'
+    $dock = New-Object System.Windows.Controls.DockPanel
+    $dock.Margin = [System.Windows.Thickness]::new(12)
+    $info = New-Object System.Windows.Controls.TextBlock
+    $info.Text = "These folders are searched while 'Folder list' is ticked. Tick Subfolders to include everything below each folder."
+    $info.TextWrapping = 'Wrap'
+    $info.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+    [System.Windows.Controls.DockPanel]::SetDock($info, [System.Windows.Controls.Dock]::Top)
+    $bp = New-Object System.Windows.Controls.StackPanel
+    $bp.Orientation = 'Horizontal'
+    $bp.HorizontalAlignment = 'Right'
+    $bp.Margin = [System.Windows.Thickness]::new(0, 10, 0, 0)
+    [System.Windows.Controls.DockPanel]::SetDock($bp, [System.Windows.Controls.Dock]::Bottom)
+    $mk = {
+        param($text, $width)
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = $text; $b.Width = $width; $b.Height = 30
+        $b.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+        return $b
+    }
+    $bAdd = & $mk 'Add current folder' 130
+    $bRem = & $mk 'Remove selected' 120
+    $bClr = & $mk 'Clear all' 90
+    $bClose = & $mk 'Close' 80
+    $bClose.IsDefault = $true; $bClose.IsCancel = $true
+    foreach ($b in @($bAdd, $bRem, $bClr, $bClose)) { [void]$bp.Children.Add($b) }
+    $lb = New-Object System.Windows.Controls.ListBox
+    $lb.SelectionMode = 'Extended'
+    [void]$dock.Children.Add($info); [void]$dock.Children.Add($bp); [void]$dock.Children.Add($lb)
+    $w.Content = $dock
+    $script:fdLb = $lb; $script:fdWin = $w
+    Update-FolderDlgList
+    $bAdd.Add_Click({ Add-SearchFolders @($txtPath.Text) $false; $script:fdChanged = $true; Update-FolderDlgList })
+    $bRem.Add_Click({
+        $sel = @($script:fdLb.SelectedItems | ForEach-Object { [string]$_ })
+        if ($sel.Count -gt 0) { Remove-SearchFolders $sel $false; $script:fdChanged = $true; Update-FolderDlgList }
+    })
+    $bClr.Add_Click({ Clear-SearchFolders $false; $script:fdChanged = $true; Update-FolderDlgList })
+    $bClose.Add_Click({ $script:fdWin.Close() })
+    [void]$w.ShowDialog()
+    if ($script:fdChanged -and $txtSearch.Text.Trim()) { $searchTimer.Stop(); Apply-Search }
+}
+
+# checkbox behaviour + its right-click menu
+$chkMulti.Add_Click({ $searchTimer.Stop(); Apply-Search })
+$cmMulti = New-Object System.Windows.Controls.ContextMenu
+$miM1 = New-Object System.Windows.Controls.MenuItem; $miM1.Header = 'Edit folder list...'
+$miM1.Add_Click({ Show-FolderListDialog })
+$miM2 = New-Object System.Windows.Controls.MenuItem; $miM2.Header = 'Clear folder list'
+$miM2.Add_Click({ Clear-SearchFolders })
+[void]$cmMulti.Items.Add($miM1); [void]$cmMulti.Items.Add($miM2)
+$chkMulti.ContextMenu = $cmMulti
+
+# left pane: right-click a folder > Add to / Remove from search folders
+$tree.Add_PreviewMouseRightButtonDown({
+    param($s, $e)
+    try {
+        $tvi = Get-AncestorOf $e.OriginalSource ([System.Windows.Controls.TreeViewItem])
+        if ($tvi -and $tvi.Tag) { $script:treeCtxPath = [string]$tvi.Tag } else { $script:treeCtxPath = $null }
+    } catch { $script:treeCtxPath = $null }
+})
+$cmTree = New-Object System.Windows.Controls.ContextMenu
+$miT1 = New-Object System.Windows.Controls.MenuItem; $miT1.Header = 'Add to search folders'
+$miT1.Add_Click({ if ($script:treeCtxPath) { Add-SearchFolders @($script:treeCtxPath) } })
+$miT2 = New-Object System.Windows.Controls.MenuItem; $miT2.Header = 'Remove from search folders'
+$miT2.Add_Click({ if ($script:treeCtxPath) { Remove-SearchFolders @($script:treeCtxPath) } })
+$miT3 = New-Object System.Windows.Controls.MenuItem; $miT3.Header = 'Edit search folders...'
+$miT3.Add_Click({ Show-FolderListDialog })
+[void]$cmTree.Items.Add($miT1); [void]$cmTree.Items.Add($miT2)
+[void]$cmTree.Items.Add((New-Object System.Windows.Controls.Separator)); [void]$cmTree.Items.Add($miT3)
+$cmTree.Add_Opened({
+    $p = $script:treeCtxPath
+    $in = $false
+    if ($p) { $in = Test-InSearchList $p }
+    $miT1.IsEnabled = [bool]($p -and -not $in)
+    $miT2.IsEnabled = [bool]($p -and $in)
+})
+$tree.ContextMenu = $cmTree
+
+# middle pane: select folders > right-click > Add to search folders
+try {
+    [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
+    $miL1 = New-Object System.Windows.Controls.MenuItem; $miL1.Header = 'Add to search folders'
+    $miL1.Add_Click({
+        $ds = @($list.SelectedItems | Where-Object { $_.IsDir } | ForEach-Object { $_.FullPath })
+        if ($ds.Count -eq 0) { $txtStatus.Text = 'Select one or more folders first.' } else { Add-SearchFolders $ds }
+    })
+    [void]$cm.Items.Add($miL1)
+} catch { Write-Log ('middle menu21: ' + $_.Exception.Message) }
+
+# ---------- search engine: folder list as the scope ----------
+function Get-DeepKey {
+    if (Test-MultiScope) { return ('M|' + [bool]$chkSub.IsChecked + '|' + ((@($script:searchFolders) | Sort-Object) -join '|').ToLowerInvariant()) }
+    return ('S|' + ([string]$txtPath.Text).TrimEnd('\').ToLowerInvariant())
+}
+
+function Reset-DeepState21 {
+    $deepTimer.Stop()
+    Hide-DeepProgress
+    try { if ($script:deepWalker) { $script:deepWalker.Stop() } } catch { }
+    try { if ($script:deepExif) { $script:deepExif.Kill() } } catch { }
+    $script:deepWalker = $null; $script:deepExif = $null
+    $script:deepReady = $false; $script:deepHasMeta = $false; $script:deepExifStarted = $false
+}
+
+function Start-Deep {
+    $multi = Test-MultiScope
+    $recurse = [bool]$chkSub.IsChecked
+    $roots = @()
+    $sroot = ''
+    if ($multi) {
+        $roots = @(@($script:searchFolders) | Where-Object { [IO.Directory]::Exists($_) })
+        if ($roots.Count -eq 0) { $txtStatus.Text = 'None of the folders in the search list exist any more.'; return }
+        if ($recurse) {
+            foreach ($rt in $roots) {
+                if ([IO.Path]::GetPathRoot($rt).TrimEnd('\') -ieq $rt.TrimEnd('\')) {
+                    $txtStatus.Text = "Subfolder search needs folders, not a whole drive. Remove $rt from the list or untick Subfolders."
+                    return
+                }
+            }
+        }
+        $script:deepRoot = ''
+    } else {
+        $sroot = $txtPath.Text
+        if (-not $sroot -or -not [IO.Directory]::Exists($sroot)) { return }
+        if ([IO.Path]::GetPathRoot($sroot).TrimEnd('\') -ieq $sroot.TrimEnd('\')) {
+            $txtStatus.Text = 'Subfolder search needs a folder, not a whole drive.'
+            return
+        }
+        $script:deepRoot = $sroot
+    }
+    $script:deepKey = Get-DeepKey
+    $script:multiActive = $multi
+    $script:deepReady = $false
+    $script:deepHasMeta = $false
+    $script:deepExifStarted = $false
+    $script:deepExif = $null
+    $script:deepFields = @{}
+    try { $script:deepIdx = New-Object DeepSearchIndex } catch { $script:deepIdx = $null }
+    $w = New-Object DeepWalker2
+    $script:deepWalker = $w
+    if ($multi) { $w.StartMulti([string[]]$roots, $recurse, 100000, [string[]]$script:xmpEmbedded) }
+    else { $w.Start($sroot, 100000, [string[]]$script:xmpEmbedded) }
+    $txtStatus.Text = 'Searching...'
+    Show-DeepProgress
+    $deepTimer.Start()
+}
+
+function Apply-Search {
+    $raw = $txtSearch.Text.Trim()
+    $pq = Parse-SearchQuery $raw
+    $script:searchTerms = $pq.Plain
+    $script:fieldTerms = $pq.Fields
+    if ($script:searchTerms.Count -eq 0 -and $script:fieldTerms.Count -eq 0) {
+        Stop-Deep
+        Restore-Folder
+        $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+        if ($v) { $v.Filter = $null; $v.Refresh() }
+        if ($script:folderStatus) { $txtStatus.Text = $script:folderStatus }
+        return
+    }
+    $needMeta = Test-SearchNeedsMeta
+    $multi = Test-MultiScope
+
+    if ($multi -or $chkSub.IsChecked) {
+        $key = Get-DeepKey
+        if ($script:deepKey -and $script:deepKey -ne $key) { Reset-DeepState21 }
+        $script:multiActive = $multi
+        if (-not $script:metaReady -and $script:deepReady) {
+            $script:deepReady = $false; $script:deepWalker = $null; $script:deepExif = $null
+        }
+        if ($script:deepReady -and $needMeta -and -not $script:deepHasMeta) {
+            $script:deepReady = $false; $script:deepWalker = $null; $script:deepExif = $null
+        }
+        if ($script:deepReady) { Show-DeepResults; return }
+        if ($script:deepWalker) { $deepTimer.Start(); return }
+        Start-Deep
+        return
+    }
+
+    $script:multiActive = $false
+    Stop-Deep
+    Restore-Folder
+    $v = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list.ItemsSource)
+    if (-not $v) { return }
+    if ($needMeta -and -not $script:metaReady) {
+        $txtStatus.Text = 'Indexing XMP metadata...'
+        $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+        Build-MetaIndex
+    }
+    $v.Filter = $script:searchPredicate
+    $v.Refresh()
+    $cnt = 0
+    foreach ($x in $v) { $cnt++ }
+    $txtStatus.Text = "$cnt match(es) for '$raw'   |   $($script:folderStatus)"
+}
+
+$script:prevShowDeep21 = ${function:Show-DeepResults}
+function Show-DeepResults {
+    & $script:prevShowDeep21
+    try {
+        if ($script:multiActive -and $script:deepActive) {
+            $n = @($script:searchFolders).Count
+            $txtStatus.Text = $txtStatus.Text.Replace('in subfolders', "in the folder list ($n)")
+        }
+    } catch { }
+}
+
+# progress wording while a folder-list search runs
+$deepTimer.Add_Tick({
+    try {
+        if ($script:multiActive -and $txtStatus.Text -like 'Searching subfolders*') {
+            $txtStatus.Text = $txtStatus.Text -replace 'Searching subfolders', 'Searching folder list'
+        }
+    } catch { }
+})
+
+# Cancel must also leave folder-list mode, or the search would restart
+$btnDeepCancel.Add_PreviewMouseLeftButtonDown({ try { $chkMulti.IsChecked = $false } catch { } })
+
+Update-FolderListUi
+
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nSEARCHING SEVERAL FOLDERS`nRight-click a folder in the left pane and choose Add to search folders. In the middle pane, select one or more folders (Ctrl+click or Shift+click), right-click and choose Add to search folders. The Folder list (N) box next to Subfolders then limits searches to exactly those folders. Tick Subfolders to include everything below each one. Results show the full folder path in the Folder column. Right-click the Folder list box to edit or clear the list; untick it to search the current folder again. The list is remembered between sessions.`n`nPress F1 any time")
+# ===== END SCRIPT21 =====
+# ===== SCRIPT22-MARKER =====
+# ---------- 1. Title box: suggestions from earlier titles (same as Subject and Tags) ----------
+$script:titleSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st22 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st22 -and $st22.TitleHistory) {
+            foreach ($x in @($st22.TitleHistory)) {
+                $s = ([string]$x).Trim()
+                if ($s -and $script:titleSet.Count -lt 2000) { [void]$script:titleSet.Add($s) }
+            }
+        }
+    }
+} catch { }
+
+$script:prevSetItemCols22 = ${function:Set-ItemCols}
+function Set-ItemCols($it, $o) {
+    & $script:prevSetItemCols22 $it $o
+    try {
+        $t = ([string]$it.TitleText).Trim()
+        if ($t -and $t.Length -le 120 -and $script:titleSet.Count -lt 2000) { [void]$script:titleSet.Add($t) }
+    } catch { }
+}
+
+$titleBox = New-Object System.Windows.Controls.ListBox
+$titleBox.MaxHeight = 170
+$titleBox.MinWidth = 160
+$titleBox.BorderBrush = [Windows.Media.Brushes]::Gray
+$titlePopup = New-Object System.Windows.Controls.Primitives.Popup
+$titlePopup.PlacementTarget = $txtTitle
+$titlePopup.Placement = 'Bottom'
+$titlePopup.StaysOpen = $false
+$titlePopup.Child = $titleBox
+
+function Accept-Title([string]$s) {
+    $titlePopup.IsOpen = $false
+    $txtTitle.Text = $s
+    $txtTitle.CaretIndex = $s.Length
+    $txtTitle.Focus() | Out-Null
+}
+function Update-TitleSuggestions {
+    try {
+        if (-not $txtTitle.IsKeyboardFocusWithin -or -not $txtTitle.IsEnabled) { $titlePopup.IsOpen = $false; return }
+        $tok = $txtTitle.Text.Trim()
+        if ($tok.Length -lt 1) { $titlePopup.IsOpen = $false; return }
+        $m = @($script:titleSet | Where-Object { $_.IndexOf($tok, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_ -ine $tok } |
+            Sort-Object @{ Expression = { -not $_.StartsWith($tok, [StringComparison]::OrdinalIgnoreCase) } }, @{ Expression = { $_ } } |
+            Select-Object -First 8)
+        if ($m.Count -eq 0) { $titlePopup.IsOpen = $false; return }
+        $titleBox.ItemsSource = [string[]]$m
+        $titleBox.SelectedIndex = -1
+        $titleBox.MinWidth = [Math]::Max(160, $txtTitle.ActualWidth)
+        $titlePopup.IsOpen = $true
+    } catch { }
+}
+$txtTitle.Add_TextChanged({ Update-TitleSuggestions })
+$txtTitle.Add_LostKeyboardFocus({ if (-not $titleBox.IsMouseOver) { $titlePopup.IsOpen = $false } })
+$txtTitle.Add_PreviewKeyDown({
+    param($s, $e)
+    if (-not $titlePopup.IsOpen) { return }
+    $k = "$($e.Key)"
+    if ($k -eq 'Down') {
+        $i = $titleBox.SelectedIndex + 1
+        if ($i -ge $titleBox.Items.Count) { $i = 0 }
+        $titleBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Up') {
+        $i = $titleBox.SelectedIndex - 1
+        if ($i -lt 0) { $i = $titleBox.Items.Count - 1 }
+        $titleBox.SelectedIndex = $i
+        $e.Handled = $true
+    }
+    elseif ($k -eq 'Tab' -or $k -eq 'Return') {
+        $v = $titleBox.SelectedItem
+        if (-not $v -and $k -eq 'Tab' -and $titleBox.Items.Count -gt 0) { $v = $titleBox.Items[0] }
+        if ($v) { Accept-Title ([string]$v); $e.Handled = $true }
+    }
+    elseif ($k -eq 'Escape') { $titlePopup.IsOpen = $false; $e.Handled = $true }
+})
+$titleBox.Add_PreviewMouseLeftButtonUp({
+    if ($titleBox.SelectedItem) { Accept-Title ([string]$titleBox.SelectedItem) }
+})
+$win.Add_Closing({
+    try { Set-Setting 'TitleHistory' ([string[]]@($script:titleSet | Sort-Object)) } catch { }
+})
+
+# ---------- 2. missing:field / has:field search terms ----------
+$script:missingMap = @{
+    subject = 'Headline'; headline = 'Headline'
+    title = 'Title'
+    tags = 'Subject'; tag = 'Subject'; keywords = 'Subject'; keyword = 'Subject'
+    comments = 'Description'; comment = 'Description'; description = 'Description'
+    author = 'Creator'; authors = 'Creator'; creator = 'Creator'
+    copyright = 'Rights'; rights = 'Rights'
+    rating = 'Rating'; stars = 'Rating'
+}
+
+$script:prevParse22 = ${function:Parse-SearchQuery}
+function Parse-SearchQuery([string]$q) {
+    $extra = New-Object 'System.Collections.Generic.List[object]'
+    $q = [string]$q
+    foreach ($m in [regex]::Matches($q, '(?i)(?<!\S)(missing|has):(\S+)')) {
+        $kind = $m.Groups[1].Value.ToLowerInvariant()
+        $nm = $m.Groups[2].Value.ToLowerInvariant().Trim('"')
+        $fk = $script:missingMap[$nm]
+        if ($fk) {
+            if ($kind -eq 'missing') { $pfx = '_present:' } else { $pfx = '_absent:' }
+            $extra.Add(@{ Key = ($pfx + $fk); Op = ''; Num = 0; Value = '' })
+        }
+    }
+    $q2 = [regex]::Replace($q, '(?i)(?<!\S)(missing|has):\S+', ' ')
+    $r = & $script:prevParse22 $q2
+    if ($extra.Count -eq 0) { return $r }
+    $script:negFields = @($script:negFields) + $extra.ToArray()
+    $fl = @($r.Fields)
+    if (@($r.Plain).Count -eq 0 -and $fl.Count -eq 0) { $fl = @(@{ Key = '_name'; Op = ''; Num = 0; Value = '' }) }
+    return @{ Plain = $r.Plain; Fields = $fl }
+}
+
+# these special terms EXCLUDE files: _present = field already filled in, _absent = field blank
+$script:prevTestFieldTerm22 = ${function:Test-FieldTerm}
+function Test-FieldTerm($ft, [string]$fileName, $ff) {
+    $k = [string]$ft.Key
+    if ($k.StartsWith('_present:') -or $k.StartsWith('_absent:')) {
+        $mode = Get-XmpMode ([pscustomobject]@{ IsDir = $false; Name = $fileName })
+        if (-not $mode) { return $true }
+        $fk = $k.Substring($k.IndexOf(':') + 1)
+        $has = $false
+        if ($ff) {
+            if ($fk -eq 'Rating') {
+                $rv = 0
+                [void][int]::TryParse([string]$ff['Rating'], [ref]$rv)
+                $has = ($rv -gt 0)
+            } else {
+                $has = (([string]$ff[$fk]).Trim().Length -gt 0)
+            }
+        }
+        if ($k.StartsWith('_present:')) { return $has }
+        return (-not $has)
+    }
+    return (& $script:prevTestFieldTerm22 $ft $fileName $ff)
+}
+
+# ---------- 3. one-click blank filters in the arrow menu beside the search box ----------
+function Set-BlankFilter([string]$name) {
+    $t = [regex]::Replace([string]$txtSearch.Text, '(?i)(?<!\S)(missing|has):\S+', ' ')
+    $t = ($t -replace '\s+', ' ').Trim()
+    if ($name) { $t = ($t + ' missing:' + $name).Trim() }
+    if ($txtSearch.Text -eq $t) { $searchTimer.Stop(); Apply-Search } else { $txtSearch.Text = $t }
+}
+
+function Show-RecentSearches {
+    $cm22 = New-Object System.Windows.Controls.ContextMenu
+    $h1 = New-Object System.Windows.Controls.MenuItem
+    $h1.Header = 'Show only files with a blank:'
+    $h1.IsEnabled = $false
+    [void]$cm22.Items.Add($h1)
+    foreach ($b in @(@('Subject', 'subject'), @('Title', 'title'), @('Tags', 'tags'), @('Comments', 'comments'), @('Authors', 'author'), @('Copyright', 'copyright'), @('Rating', 'rating'))) {
+        $mb = New-Object System.Windows.Controls.MenuItem
+        $mb.Header = '    ' + $b[0]
+        $mb.Tag = [string]$b[1]
+        $mb.Add_Click({ param($s, $e) Set-BlankFilter ([string]$s.Tag) })
+        [void]$cm22.Items.Add($mb)
+    }
+    $ma = New-Object System.Windows.Controls.MenuItem
+    $ma.Header = '    Show all files again'
+    $ma.Tag = ''
+    $ma.Add_Click({ param($s, $e) Set-BlankFilter '' })
+    [void]$cm22.Items.Add($ma)
+    [void]$cm22.Items.Add((New-Object System.Windows.Controls.Separator))
+    $h2 = New-Object System.Windows.Controls.MenuItem
+    $h2.Header = 'Recent searches:'
+    $h2.IsEnabled = $false
+    [void]$cm22.Items.Add($h2)
+    $recent = @($script:recentSearches)
+    if ($recent.Count -eq 0) {
+        $mi0 = New-Object System.Windows.Controls.MenuItem
+        $mi0.Header = '    (none yet)'
+        $mi0.IsEnabled = $false
+        [void]$cm22.Items.Add($mi0)
+    } else {
+        foreach ($r in $recent) {
+            $mi = New-Object System.Windows.Controls.MenuItem
+            $tbk = New-Object System.Windows.Controls.TextBlock
+            $tbk.Text = '    ' + [string]$r
+            $mi.Header = $tbk
+            $mi.Tag = [string]$r
+            $mi.Add_Click({ param($s, $e) Use-RecentSearch ([string]$s.Tag) })
+            [void]$cm22.Items.Add($mi)
+        }
+        [void]$cm22.Items.Add((New-Object System.Windows.Controls.Separator))
+        $mc = New-Object System.Windows.Controls.MenuItem
+        $mc.Header = 'Clear recent searches'
+        $mc.Add_Click({ Clear-RecentSearches })
+        [void]$cm22.Items.Add($mc)
+    }
+    $cm22.PlacementTarget = $btnRecent
+    $cm22.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $cm22.IsOpen = $true
+}
+$btnRecent.ToolTip = 'Blank-field filters and recent searches'
+
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nFINDING FILES THAT STILL NEED TAGGING`nClick the arrow beside the search box and choose Show only files with a blank: Subject (or Title, Tags, Comments, Authors, Copyright, Rating). Only files whose box is empty are shown, in Details or Thumbnails view, so you can select them and tag without touching files that are already done. You can also type missing:subject, missing:tags and so on, and combine with other terms, for example missing:subject ext:jpg. has:subject shows only files that do have one. Press Enter in the search box to refresh the list after saving. Choose Show all files again to clear it.`nThe Title box also suggests earlier titles as you type, like Subject and Tags.`n`nPress F1 any time")
+# ===== END SCRIPT22 =====
+# ===== SCRIPT23-MARKER =====
+# ---------- 1. Filter chips: search within results ----------
+$script:chips = New-Object 'System.Collections.Generic.List[string]'
+$script:brushConv23 = New-Object System.Windows.Media.BrushConverter
+
+$pathBar23 = $txtPath.Parent
+$chipPanel = New-Object System.Windows.Controls.StackPanel
+$chipPanel.Orientation = 'Horizontal'
+$chipPanel.VerticalAlignment = 'Center'
+$chipPanel.Visibility = 'Collapsed'
+[System.Windows.Controls.DockPanel]::SetDock($chipPanel, [System.Windows.Controls.Dock]::Right)
+
+function Update-ChipUi {
+    $chipPanel.Children.Clear()
+    $n = $script:chips.Count
+    if ($n -eq 0) { $chipPanel.Visibility = 'Collapsed'; return }
+    $chipPanel.Visibility = 'Visible'
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = 'Narrowed by:'
+    $lbl.FontSize = 11
+    $lbl.Foreground = [System.Windows.Media.Brushes]::DimGray
+    $lbl.VerticalAlignment = 'Center'
+    $lbl.Margin = [System.Windows.Thickness]::new(10, 0, 6, 0)
+    [void]$chipPanel.Children.Add($lbl)
+    for ($i = 0; $i -lt $n; $i++) {
+        $bd = New-Object System.Windows.Controls.Border
+        $bd.CornerRadius = [System.Windows.CornerRadius]::new(10)
+        $bd.Background = $script:brushConv23.ConvertFromString('#E3F2FD')
+        $bd.BorderBrush = $script:brushConv23.ConvertFromString('#90CAF9')
+        $bd.BorderThickness = [System.Windows.Thickness]::new(1)
+        $bd.Padding = [System.Windows.Thickness]::new(8, 1, 4, 1)
+        $bd.Margin = [System.Windows.Thickness]::new(0, 0, 4, 0)
+        $bd.ToolTip = $script:chips[$i] + "`nClick the text to edit it, the x to remove it"
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Orientation = 'Horizontal'
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.Text = $script:chips[$i]
+        $tb.FontSize = 12
+        $tb.MaxWidth = 150
+        $tb.TextTrimming = 'CharacterEllipsis'
+        $tb.VerticalAlignment = 'Center'
+        $tb.Tag = $i
+        $tb.Cursor = [System.Windows.Input.Cursors]::Hand
+        $tb.Add_MouseLeftButtonUp({ param($s, $e) Edit-Chip ([int]$s.Tag) })
+        $x = New-Object System.Windows.Controls.TextBlock
+        $x.Text = [string][char]0x2715
+        $x.FontSize = 11
+        $x.Foreground = [System.Windows.Media.Brushes]::DimGray
+        $x.Margin = [System.Windows.Thickness]::new(6, 0, 2, 0)
+        $x.VerticalAlignment = 'Center'
+        $x.Tag = $i
+        $x.Cursor = [System.Windows.Input.Cursors]::Hand
+        $x.ToolTip = 'Remove this filter'
+        $x.Add_MouseLeftButtonUp({ param($s, $e) Remove-Chip ([int]$s.Tag) })
+        [void]$sp.Children.Add($tb); [void]$sp.Children.Add($x)
+        $bd.Child = $sp
+        [void]$chipPanel.Children.Add($bd)
+    }
+    $ca = New-Object System.Windows.Controls.TextBlock
+    $ca.Text = 'Clear all'
+    $ca.FontSize = 11
+    $ca.Foreground = $script:brushConv23.ConvertFromString('#1565C0')
+    $ca.TextDecorations = [System.Windows.TextDecorations]::Underline
+    $ca.VerticalAlignment = 'Center'
+    $ca.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
+    $ca.Cursor = [System.Windows.Input.Cursors]::Hand
+    $ca.Add_MouseLeftButtonUp({ param($s, $e) Clear-Chips })
+    [void]$chipPanel.Children.Add($ca)
+}
+
+function Add-Chip([string]$t) {
+    $t = $t.Trim()
+    if (-not $t) { return }
+    foreach ($c in $script:chips) { if ($c -ieq $t) { return } }
+    [void]$script:chips.Add($t)
+    Update-ChipUi
+}
+function Remove-Chip([int]$i) {
+    if ($i -ge 0 -and $i -lt $script:chips.Count) { $script:chips.RemoveAt($i) }
+    Update-ChipUi
+    $searchTimer.Stop(); Apply-Search
+}
+function Clear-Chips([bool]$rerun = $true) {
+    $script:chips.Clear()
+    Update-ChipUi
+    if ($rerun) { $searchTimer.Stop(); Apply-Search }
+}
+function Edit-Chip([int]$i) {
+    if ($i -lt 0 -or $i -ge $script:chips.Count) { return }
+    $t = $script:chips[$i]
+    $script:chips.RemoveAt($i)
+    $cur = $txtSearch.Text.Trim()
+    if ($cur) { [void]$script:chips.Add($cur) }
+    Update-ChipUi
+    $txtSearch.Text = $t
+    $txtSearch.Focus() | Out-Null
+    $txtSearch.CaretIndex = $txtSearch.Text.Length
+}
+
+# the effective query is: all chips + whatever is in the search box
+$script:prevParse23 = ${function:Parse-SearchQuery}
+function Parse-SearchQuery([string]$q) {
+    if ($script:chips.Count -gt 0) { $q = ((@($script:chips) -join ' ') + ' ' + $q) }
+    return (& $script:prevParse23 $q)
+}
+
+# status text should name the chips too
+function Add-ChipsToStatus {
+    try {
+        if ($script:chips.Count -gt 0) {
+            $raw = $txtSearch.Text.Trim()
+            $parts = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($c in $script:chips) { $parts.Add($c) }
+            if ($raw) { $parts.Add($raw) }
+            $desc = $parts -join ' + '
+            $txtStatus.Text = ([string]$txtStatus.Text).Replace("for '$raw'", "for '$desc'")
+        }
+    } catch { }
+}
+$script:prevApplySearch23 = ${function:Apply-Search}
+function Apply-Search { & $script:prevApplySearch23; Add-ChipsToStatus }
+$script:prevShowDeep23 = ${function:Show-DeepResults}
+function Show-DeepResults { & $script:prevShowDeep23; Add-ChipsToStatus }
+
+# a new folder starts a fresh search, so chips clear too
+$script:prevResetSearch23 = ${function:Reset-Search}
+function Reset-Search {
+    & $script:prevResetSearch23
+    try { if ($script:chips.Count -gt 0) { Clear-Chips $false } } catch { }
+}
+
+# Enter turns the search into a chip; Esc clears the box, then the chips
+$pathBar23.Children.Insert($pathBar23.Children.IndexOf($txtPath), $chipPanel)
+$txtSearch.Parent.Add_PreviewKeyDown({
+    param($s, $e)
+    if (-not $txtSearch.IsKeyboardFocusWithin) { return }
+    $k = "$($e.Key)"
+    if ($k -eq 'Return') {
+        $t = $txtSearch.Text.Trim()
+        if ($t) {
+            $parts = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($c in $script:chips) { $parts.Add($c) }
+            $parts.Add($t)
+            Add-RecentSearch ($parts -join ' ')
+            Add-Chip $t
+            $txtSearch.Text = ''
+            $searchTimer.Stop()
+            Apply-Search
+            $e.Handled = $true
+        }
+    }
+    elseif ($k -eq 'Escape' -and $script:chips.Count -gt 0) {
+        if ($txtSearch.Text) { $txtSearch.Text = '' }
+        else { Clear-Chips; $list.Focus() | Out-Null }
+        $e.Handled = $true
+    }
+})
+
+# a recent search holds the whole chain, so it replaces the chips
+function Use-RecentSearch([string]$q) {
+    if (-not $q) { return }
+    Clear-Chips $false
+    Add-RecentSearch $q
+    if ($txtSearch.Text -eq $q) { $searchTimer.Stop(); Apply-Search } else { $txtSearch.Text = $q }
+    $txtSearch.Focus() | Out-Null
+    $txtSearch.CaretIndex = $txtSearch.Text.Length
+}
+
+# blank-field filters become a chip (replacing any earlier blank filter)
+function Set-BlankFilter([string]$name) {
+    $t = [regex]::Replace([string]$txtSearch.Text, '(?i)(?<!\S)(missing|has):\S+', ' ')
+    $t = ($t -replace '\s+', ' ').Trim()
+    for ($i = $script:chips.Count - 1; $i -ge 0; $i--) {
+        if ($script:chips[$i] -match '(?i)^(missing|has):') { $script:chips.RemoveAt($i) }
+    }
+    if ($name) { [void]$script:chips.Add('missing:' + $name) }
+    Update-ChipUi
+    if ($txtSearch.Text -ne $t) { $txtSearch.Text = $t }
+    $searchTimer.Stop()
+    Apply-Search
+}
+
+# ---------- 2. Captions in Thumbnails view ----------
+$script:captionMode = 'Subject'
+try {
+    if ([IO.File]::Exists($settingsFile)) {
+        $st23 = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        if ($st23 -and $st23.CaptionMode) { $script:captionMode = [string]$st23.CaptionMode }
+    }
+} catch { }
+
+function Set-TileResources {
+    $S = [int]$script:tileSize
+    $fs = [Math]::Max(13, [Math]::Min(22, [int](14 + $S / 50)))
+    $cf = [Math]::Max(10, $fs - 3)
+    $ch = [int]($cf * 2.6)
+    $capProp = ''; $capBlank = ''
+    switch ($script:captionMode) {
+        'Subject'  { $capProp = 'SubjectText'; $capBlank = '(no subject)' }
+        'Title'    { $capProp = 'TitleText'; $capBlank = '(no title)' }
+        'Tags'     { $capProp = 'TagsText'; $capBlank = '(no tags)' }
+        'Comments' { $capProp = 'CommentText'; $capBlank = '(no comment)' }
+        'Authors'  { $capProp = 'AuthorText'; $capBlank = '(no author)' }
+    }
+    $extra = 0
+    $capXaml = ''
+    if ($capProp) {
+        $extra = $ch + 4
+        $capXaml = @"
+    <TextBlock Width="@@TW@@" TextAlignment="Center" TextTrimming="CharacterEllipsis" TextWrapping="Wrap" Margin="0,2,0,0" FontSize="@@CF@@" MaxHeight="@@CH@@">
+      <TextBlock.Style>
+        <Style TargetType="TextBlock">
+          <Setter Property="Foreground" Value="#555555"/>
+          <Setter Property="Text" Value="{Binding @@CP@@}"/>
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding @@CP@@}" Value="">
+              <Setter Property="Text" Value="@@CB@@"/>
+              <Setter Property="FontStyle" Value="Italic"/>
+              <Setter Property="Foreground" Value="#A8A8A8"/>
+            </DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </TextBlock.Style>
+    </TextBlock>
+"@
+    }
+    $map = @{
+        '@@S@@'  = "$S"
+        '@@BW@@' = "$($S + 52)"
+        '@@BH@@' = "$($S + 78 + $extra)"
+        '@@TW@@' = "$($S + 36)"
+        '@@FS@@' = "$fs"
+        '@@MH@@' = "$([int]($fs * 2.9))"
+        '@@BF@@' = "$([Math]::Max(10, [int](12 * $S / 100)))"
+        '@@CF@@' = "$cf"
+        '@@CH@@' = "$ch"
+        '@@CP@@' = $capProp
+        '@@CB@@' = $capBlank
+    }
+    $tpl = @"
+<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <StackPanel Margin="8,6" HorizontalAlignment="Center">
+    <Grid Width="@@S@@" Height="@@S@@">
+      <Border CornerRadius="8" Background="{Binding BadgeColor}">
+        <TextBlock Text="{Binding Badge}" Foreground="White" FontWeight="Bold" FontSize="@@BF@@"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <Image Source="{Binding Thumb}" Stretch="UniformToFill"/>
+    </Grid>
+    <TextBlock Text="{Binding Name}" ToolTip="{Binding FullPath}" Width="@@TW@@" TextAlignment="Center"
+               TextTrimming="CharacterEllipsis" Margin="0,6,0,0" FontSize="@@FS@@" TextWrapping="Wrap" MaxHeight="@@MH@@"/>
+@@CAPTION@@
+  </StackPanel>
+</DataTemplate>
+"@
+    $sty = @"
+<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="ListViewItem">
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ListViewItem">
+        <Border x:Name="bd" Width="@@BW@@" Height="@@BH@@" Margin="1" BorderThickness="1" BorderBrush="Transparent" Background="Transparent">
+          <ContentPresenter/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#E6F0FB"/><Setter TargetName="bd" Property="BorderBrush" Value="#B8D4F0"/></Trigger>
+          <Trigger Property="IsSelected" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="#C9E2FB"/>
+            <Setter TargetName="bd" Property="BorderBrush" Value="#1F6FD0"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+"@
+    $tpl = $tpl.Replace('@@CAPTION@@', $capXaml)
+    foreach ($k in @($map.Keys)) { $tpl = $tpl.Replace($k, $map[$k]); $sty = $sty.Replace($k, $map[$k]) }
+    $win.Resources['tileTemplate'] = [Windows.Markup.XamlReader]::Parse($tpl)
+    $win.Resources['tileStyle'] = [Windows.Markup.XamlReader]::Parse($sty)
+}
+
+$btnCaption = New-Object System.Windows.Controls.Button
+try { $btnCaption.Style = $win.FindResource('TB') } catch { }
+$btnCaption.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+$btnCaption.ToolTip = 'What to show under each thumbnail'
+[System.Windows.Controls.DockPanel]::SetDock($btnCaption, [System.Windows.Controls.Dock]::Right)
+$pathBar23.Children.Insert($pathBar23.Children.IndexOf($txtPath), $btnCaption)
+if ($rbThumbs.IsChecked) { $btnCaption.Visibility = 'Visible' } else { $btnCaption.Visibility = 'Collapsed' }
+$rbThumbs.Add_Checked({ $btnCaption.Visibility = 'Visible' })
+$rbThumbs.Add_Unchecked({ $btnCaption.Visibility = 'Collapsed' })
+
+function Update-CaptionButton {
+    $btnCaption.Content = 'Captions: ' + $script:captionMode + ' ' + [string][char]0x25BE
+}
+function Set-CaptionMode([string]$m) {
+    $script:captionMode = $m
+    Set-Setting 'CaptionMode' $m
+    Update-CaptionButton
+    Apply-TileSize
+}
+$btnCaption.Add_Click({
+    $cmc = New-Object System.Windows.Controls.ContextMenu
+    $tick = [string][char]0x2713 + ' '
+    foreach ($m in 'None', 'Subject', 'Title', 'Tags', 'Comments', 'Authors') {
+        $mi = New-Object System.Windows.Controls.MenuItem
+        if ($m -eq $script:captionMode) { $mi.Header = $tick + $m } else { $mi.Header = '    ' + $m }
+        $mi.Tag = $m
+        $mi.Add_Click({ param($s, $e) Set-CaptionMode ([string]$s.Tag) })
+        [void]$cmc.Items.Add($mi)
+    }
+    $cmc.PlacementTarget = $btnCaption
+    $cmc.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $cmc.IsOpen = $true
+})
+Update-CaptionButton
+Set-TileResources
+if ($rbThumbs.IsChecked) { Apply-View }
+
+# ---------- Help ----------
+$script:helpText = $script:helpText.Replace("`n`nPress F1 any time", "`n`nSEARCH WITHIN RESULTS (FILTER CHIPS)`nType a search and press Enter. It becomes a chip beside the Path box and the list shows the matches. Search again and press Enter to narrow further; every chip must match. Click a chip's text to edit it, its x to remove it, or Clear all. Esc clears the box, then the chips. The blank-field filters from the arrow menu are chips too. Chips clear when you open another folder.`n`nCAPTIONS IN THUMBNAILS VIEW`nUse the Captions button (right of the Path box, Thumbnails view only) to show Subject, Title, Tags, Comments or Authors under each thumbnail. A file with nothing in that field shows a pale (no subject) style note, so untagged files stand out. Your choice is remembered.`n`nPress F1 any time")
+# ===== END SCRIPT23 =====
 $win.ShowDialog() | Out-Null
 
 
